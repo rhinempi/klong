@@ -26,7 +26,7 @@
 
 namespace {
 
-constexpr uint64_t kDefaultMaxBloomBytes = 30ULL * 1024 * 1024 * 1024;
+constexpr uint64_t kDefaultMaxBloomBytes = 60ULL * 1024 * 1024 * 1024;
 constexpr uint64_t kMinReserveBytes = 1ULL * 1024 * 1024 * 1024;
 constexpr uint64_t kSplitMixSeed = 0x9e3779b97f4a7c15ULL;
 
@@ -37,7 +37,7 @@ struct Options {
   unsigned short_k{0};
   unsigned long_k{0};
   int num_threads{1};
-  double max_bloom_gb{30.0};
+  double max_bloom_gb{60.0};
   double reserve_gb{1.0};
   int max_hashes{16};
 };
@@ -78,6 +78,8 @@ void SetPackedBase(KmerKey *key, unsigned index, uint8_t base) {
   key->words[word] |= static_cast<uint64_t>(base) << shift;
 }
 
+unsigned EdgeLength(const EdgeIoMetadata &meta) { return meta.kmer_size + 1; }
+
 int CompareForwardAndReverseComplement(const uint32_t *edge, unsigned offset,
                                        unsigned k) {
   for (unsigned i = 0; i < k; ++i) {
@@ -105,6 +107,16 @@ std::string BasesFromEdge(const uint32_t *edge, unsigned offset, unsigned k) {
   std::string s;
   s.reserve(k);
   for (unsigned i = 0; i < k; ++i) s.push_back(bases[GetBase(edge, offset + i)]);
+  return s;
+}
+
+std::string ReverseComplementBasesFromEdge(const uint32_t *edge, unsigned offset, unsigned k) {
+  static const char bases[] = {'A', 'C', 'G', 'T'};
+  std::string s;
+  s.reserve(k);
+  for (unsigned i = 0; i < k; ++i) {
+    s.push_back(bases[3 - GetBase(edge, offset + k - 1 - i)]);
+  }
   return s;
 }
 
@@ -251,8 +263,8 @@ uint64_t SelectBloomByteCap(const Options &opt) {
 void WriteSummary(const std::string &path, const Options &opt,
                   const EdgeIoMetadata &short_meta, const EdgeIoMetadata &long_meta,
                   const BloomFilter &bloom, uint64_t long_records,
-                  uint64_t short_observations, uint64_t bloom_hits,
-                  uint64_t bloom_misses) {
+                  uint64_t bloom_insertions, uint64_t short_observations,
+                  uint64_t bloom_hits, uint64_t bloom_misses, unsigned key_len) {
   std::ofstream out(path);
   out << "short_k\t" << opt.short_k << '\n';
   out << "long_k\t" << opt.long_k << '\n';
@@ -261,7 +273,9 @@ void WriteSummary(const std::string &path, const Options &opt,
   out << "short_edge_kmer_size\t" << short_meta.kmer_size << '\n';
   out << "long_edge_kmer_size\t" << long_meta.kmer_size << '\n';
   out << "long_edge_records\t" << long_records << '\n';
-  out << "short_kmer_observations\t" << short_observations << '\n';
+  out << "bloom_insertions\t" << bloom_insertions << '\n';
+  out << "reduction_key_bases\t" << key_len << '\n';
+  out << "short_edge_observations\t" << short_observations << '\n';
   out << "bloom_hits_probably_removed\t" << bloom_hits << '\n';
   out << "bloom_misses_not_removed\t" << bloom_misses << '\n';
   out << "bloom_bits\t" << bloom.num_bits() << '\n';
@@ -274,9 +288,9 @@ void WriteSummary(const std::string &path, const Options &opt,
       << (static_cast<double>(bloom.num_bytes()) * 2 / 1024.0 / 1024.0 / 1024.0) << '\n';
   out << "bloom_hashes\t" << bloom.num_hashes() << '\n';
   out << "estimated_false_positive_rate\t"
-      << std::setprecision(12) << EstimateFpr(bloom.num_bits(), long_records, bloom.num_hashes()) << '\n';
+      << std::setprecision(12) << EstimateFpr(bloom.num_bits(), bloom_insertions, bloom.num_hashes()) << '\n';
   out << "threads\t" << opt.num_threads << '\n';
-  out << "representation\tbinary_edges_2bit_canonical_kmers\n";
+  out << "representation\tbinary_edges_2bit_canonical_edge_prefixes_both_orientations\n";
   out << "removed_file\t" << opt.output_prefix << ".removed.txt\n";
   out << "non_removed_file\t" << opt.output_prefix << ".non_removed.txt\n";
 }
@@ -287,7 +301,7 @@ Options ParseOptions(int argc, char **argv) {
   desc.AddOption("short_prefix", "s", opt.short_prefix, "(*) prefix of shorter k binary edge files");
   desc.AddOption("long_prefix", "l", opt.long_prefix, "(*) prefix of longer k binary edge files");
   desc.AddOption("output_prefix", "o", opt.output_prefix, "(*) output prefix for debug reports");
-  desc.AddOption("short_k", "k", opt.short_k, "(*) shorter k-mer size to compare");
+  desc.AddOption("short_k", "k", opt.short_k, "(*) shorter k-mer size whose (k+1)-edges are compared");
   desc.AddOption("long_k", "K", opt.long_k, "(*) longer k-mer size to report");
   desc.AddOption("num_cpu_threads", "t", opt.num_threads, "number of CPU threads");
   desc.AddOption("max_bloom_gb", "m", opt.max_bloom_gb, "max Bloom filter memory in GB");
@@ -312,35 +326,42 @@ int main_prefix_bloom(int argc, char **argv) {
   EdgeIoMetadata short_meta = LoadMetadata(opt.short_prefix);
   EdgeIoMetadata long_meta = LoadMetadata(opt.long_prefix);
 
-  if (short_meta.kmer_size < opt.short_k || long_meta.kmer_size < opt.long_k ||
-      long_meta.kmer_size < opt.short_k) {
+  if (short_meta.kmer_size != opt.short_k || long_meta.kmer_size != opt.long_k) {
     xfatal("Invalid k sizes: short edge k {}, long edge k {}, requested short {}, long {}\n",
            short_meta.kmer_size, long_meta.kmer_size, opt.short_k, opt.long_k);
   }
 
+  const unsigned key_len = EdgeLength(short_meta);
+  if (EdgeLength(long_meta) < key_len) {
+    xfatal("Long edge length {} is shorter than reduction key length {}\n",
+           EdgeLength(long_meta), key_len);
+  }
+
   uint64_t long_records = TotalRecords(long_meta);
+  uint64_t bloom_insertions = long_records * 2;
   uint64_t bloom_byte_cap = SelectBloomByteCap(opt);
-  uint64_t target_bytes = std::max<uint64_t>(8ULL << 20, long_records * 10ULL);
+  uint64_t target_bytes = std::max<uint64_t>(64ULL << 20, bloom_insertions * 64ULL);
   uint64_t bloom_bytes = std::min(bloom_byte_cap / 2, target_bytes);
   if (bloom_bytes < (8ULL << 20)) bloom_bytes = std::min<uint64_t>(bloom_byte_cap, 8ULL << 20);
   uint64_t bloom_bits = bloom_bytes * 8;
-  int hashes = ChooseHashCount(bloom_bits, std::max<uint64_t>(1, long_records), opt.max_hashes);
+  int hashes = ChooseHashCount(bloom_bits, std::max<uint64_t>(1, bloom_insertions), opt.max_hashes);
   BloomFilter bloom(bloom_bits, hashes);
   BloomFilter candidate_bloom(bloom_bits, hashes);
 
   xinfo("Prefix Bloom: long records {}, Bloom bytes each {}, hashes {}, estimated FPR {}\n",
         long_records, bloom.num_bytes(), bloom.num_hashes(),
-        EstimateFpr(bloom.num_bits(), long_records, bloom.num_hashes()));
+        EstimateFpr(bloom.num_bits(), bloom_insertions, bloom.num_hashes()));
 
 #pragma omp parallel for schedule(dynamic) num_threads(opt.num_threads)
   for (int file_id = 0; file_id < static_cast<int>(long_meta.num_files); ++file_id) {
     ForEachEdgeInFile(opt.long_prefix, long_meta, file_id, [&](const uint32_t *edge) {
-      bloom.Add(CanonicalKmerFromEdge(edge, 0, opt.short_k));
+      bloom.Add(CanonicalKmerFromEdge(edge, 0, key_len));
+      bloom.Add(CanonicalKmerFromEdge(edge, EdgeLength(long_meta) - key_len, key_len));
     });
   }
 
   std::ofstream non_removed(opt.output_prefix + ".non_removed.txt");
-  non_removed << "#canonical_short_kmer\tshort_kmer_as_seen\tshort_edge\tshort_edge_multiplicity\treason\n";
+  non_removed << "#canonical_short_edge\tshort_edge_as_seen\tshort_edge_multiplicity\treason\n";
 
   std::atomic<uint64_t> short_observations{0};
   std::atomic<uint64_t> bloom_hits{0};
@@ -353,27 +374,19 @@ int main_prefix_bloom(int argc, char **argv) {
 #ifdef _OPENMP
     tid = omp_get_thread_num();
 #endif
-    auto emit_short_kmer = [&](const uint32_t *edge, unsigned offset) {
-      KmerKey key = CanonicalKmerFromEdge(edge, offset, opt.short_k);
+    ForEachEdgeInFile(opt.short_prefix, short_meta, file_id, [&](const uint32_t *edge) {
+      KmerKey key = CanonicalKmerFromEdge(edge, 0, key_len);
       bool hit = bloom.Contains(key);
       short_observations.fetch_add(1, std::memory_order_relaxed);
       if (hit) {
         candidate_bloom.Add(key);
         bloom_hits.fetch_add(1, std::memory_order_relaxed);
       } else {
-        non_removed_buffers[tid] << BasesFromKey(key, opt.short_k) << '\t'
-                                 << BasesFromEdge(edge, offset, opt.short_k) << '\t'
-                                 << BasesFromEdge(edge, 0, short_meta.kmer_size + 1) << '\t'
+        non_removed_buffers[tid] << BasesFromKey(key, key_len) << '\t'
+                                 << BasesFromEdge(edge, 0, key_len) << '\t'
                                  << Multiplicity(edge, short_meta.words_per_edge) << '\t'
                                  << "bloom_absent" << '\n';
         bloom_misses.fetch_add(1, std::memory_order_relaxed);
-      }
-    };
-
-    ForEachEdgeInFile(opt.short_prefix, short_meta, file_id, [&](const uint32_t *edge) {
-      emit_short_kmer(edge, 0);
-      if (short_meta.kmer_size + 1 > opt.short_k) {
-        emit_short_kmer(edge, short_meta.kmer_size + 1 - opt.short_k);
       }
     });
   }
@@ -383,7 +396,7 @@ int main_prefix_bloom(int argc, char **argv) {
   }
 
   std::ofstream removed(opt.output_prefix + ".removed.txt");
-  removed << "#canonical_short_kmer\tlong_kmer_prefix\tcanonical_long_kmer_prefix\tlong_edge\tlong_edge_multiplicity\treason\n";
+  removed << "#canonical_short_edge\tlong_edge_prefix\tcanonical_long_edge_prefix\tlong_edge\tlong_edge_multiplicity\torientation\treason\n";
   std::vector<std::ostringstream> removed_buffers(opt.num_threads);
 
 #pragma omp parallel for schedule(dynamic) num_threads(opt.num_threads)
@@ -393,22 +406,29 @@ int main_prefix_bloom(int argc, char **argv) {
     tid = omp_get_thread_num();
 #endif
     ForEachEdgeInFile(opt.long_prefix, long_meta, file_id, [&](const uint32_t *edge) {
-      KmerKey short_key = CanonicalKmerFromEdge(edge, 0, opt.short_k);
-      if (!candidate_bloom.Contains(short_key)) return;
-      KmerKey long_key = CanonicalKmerFromEdge(edge, 0, opt.long_k);
-      removed_buffers[tid] << BasesFromKey(short_key, opt.short_k) << '\t'
-                           << BasesFromEdge(edge, 0, opt.long_k) << '\t'
-                           << BasesFromKey(long_key, opt.long_k) << '\t'
-                           << BasesFromEdge(edge, 0, long_meta.kmer_size + 1) << '\t'
-                           << Multiplicity(edge, long_meta.words_per_edge) << '\t'
-                           << "candidate_bloom_present_long_prefix_counterpart" << '\n';
+      auto emit_long_prefix = [&](unsigned offset, const char *orientation) {
+        KmerKey short_key = CanonicalKmerFromEdge(edge, offset, key_len);
+        if (!candidate_bloom.Contains(short_key)) return;
+        std::string oriented_prefix =
+            offset == 0 ? BasesFromEdge(edge, offset, key_len)
+                        : ReverseComplementBasesFromEdge(edge, offset, key_len);
+        removed_buffers[tid] << BasesFromKey(short_key, key_len) << '\t'
+                             << oriented_prefix << '\t'
+                             << BasesFromKey(short_key, key_len) << '\t'
+                             << BasesFromEdge(edge, 0, EdgeLength(long_meta)) << '\t'
+                             << Multiplicity(edge, long_meta.words_per_edge) << '\t'
+                             << orientation << '\t'
+                             << "candidate_bloom_present_long_edge_prefix_counterpart" << '\n';
+      };
+      emit_long_prefix(0, "forward_prefix");
+      emit_long_prefix(EdgeLength(long_meta) - key_len, "reverse_complement_prefix");
     });
   }
   for (int i = 0; i < opt.num_threads; ++i) removed << removed_buffers[i].str();
 
   WriteSummary(opt.output_prefix + ".summary.txt", opt, short_meta, long_meta, bloom,
-               long_records, short_observations.load(), bloom_hits.load(),
-               bloom_misses.load());
+               long_records, bloom_insertions, short_observations.load(),
+               bloom_hits.load(), bloom_misses.load(), key_len);
 
   xinfo("Prefix Bloom report wrote {s}.removed.txt and {s}.non_removed.txt\n",
         opt.output_prefix.c_str(), opt.output_prefix.c_str());

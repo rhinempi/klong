@@ -837,7 +837,7 @@ def report_short_kmers_represented_by_long_prefix(short_k, long_k):
                   '--short_k', str(short_k),
                   '--long_k', str(long_k),
                   '--num_cpu_threads', str(opt.num_cpu_threads),
-                  '--max_bloom_gb', '30',
+                  '--max_bloom_gb', '60',
                   '--reserve_gb', '1']
     run_sub_command([opt.megahit_core, 'prefixbf'] + report_opt,
                     'Bloom-filter shorter k-mers represented by longer prefixes for k = %d to %d ' %
