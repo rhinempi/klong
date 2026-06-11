@@ -67,56 +67,48 @@ endif (TSAN)
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}: ${CMAKE_CXX_FLAGS}")
 
-add_executable(megahit_core ${OTHER_SOURCE} ${ASMBL_SOURCE} ${IDBA_SOURCE} ${SDBG_SOURCE} ${LCASM_SOURCE} ${SEQ_SOURCE}
-        ${CX1_SOURCE} ${TOOLKIT_SOURCE})
-add_executable(megahit_core_popcnt ${OTHER_SOURCE} ${ASMBL_SOURCE} ${IDBA_SOURCE} ${SDBG_SOURCE} ${LCASM_SOURCE} ${SEQ_SOURCE}
-        ${CX1_SOURCE} ${TOOLKIT_SOURCE})
-add_executable(megahit_core_no_hw_accel ${OTHER_SOURCE} ${ASMBL_SOURCE} ${IDBA_SOURCE} ${SDBG_SOURCE} ${LCASM_SOURCE}
-        ${SEQ_SOURCE} ${CX1_SOURCE} ${TOOLKIT_SOURCE})
+set(MEGAHIT_CORE_SOURCE
+        ${OTHER_SOURCE}
+        ${ASMBL_SOURCE}
+        ${IDBA_SOURCE}
+        ${SDBG_SOURCE}
+        ${LCASM_SOURCE}
+        ${SEQ_SOURCE}
+        ${CX1_SOURCE}
+        ${TOOLKIT_SOURCE})
 
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(amd64)|(AMD64)")
-    set_target_properties(megahit_core PROPERTIES COMPILE_FLAGS "-mbmi2 -DUSE_BMI2 -mpopcnt")
-    set_target_properties(megahit_core_popcnt PROPERTIES COMPILE_FLAGS "-mpopcnt")
-endif ()
+add_executable(megahit_core ${MEGAHIT_CORE_SOURCE})
 
 
 if (STATIC_BUILD)
     # TODO dirty
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--whole-archive -lpthread -Wl,--no-whole-archive -static")
-    set_target_properties(megahit_core megahit_core_popcnt megahit_core_no_hw_accel PROPERTIES LINK_SEARCH_START_STATIC ON)
-    set_target_properties(megahit_core megahit_core_popcnt megahit_core_no_hw_accel PROPERTIES LINK_SEARCH_END_STATIC ON)
+    set_target_properties(megahit_core PROPERTIES LINK_SEARCH_START_STATIC ON)
+    set_target_properties(megahit_core PROPERTIES LINK_SEARCH_END_STATIC ON)
 endif (STATIC_BUILD)
 
 target_link_libraries(megahit_core ${ZLIB_LIBRARIES})
-target_link_libraries(megahit_core_popcnt ${ZLIB_LIBRARIES})
-target_link_libraries(megahit_core_no_hw_accel ${ZLIB_LIBRARIES})
 
-add_custom_target(
-        megahit ALL
-        COMMAND cp ${CMAKE_SOURCE_DIR}/src/megahit .
-)
+add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/megahit
+        COMMAND python3 ${CMAKE_SOURCE_DIR}/cmake/embed_megahit.py
+                --launcher ${CMAKE_SOURCE_DIR}/src/megahit
+                --core $<TARGET_FILE:megahit_core>
+                --output ${CMAKE_CURRENT_BINARY_DIR}/megahit
+        DEPENDS megahit_core ${CMAKE_SOURCE_DIR}/src/megahit ${CMAKE_SOURCE_DIR}/cmake/embed_megahit.py
+        VERBATIM)
 
-add_custom_target(megahit_toolkit ALL
-        COMMAND ${CMAKE_COMMAND} -E create_symlink megahit_core_no_hw_accel megahit_toolkit)
+add_custom_target(embedded_megahit ALL
+        DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/megahit)
 
 set(TEST_DATA ${CMAKE_SOURCE_DIR}/test_data)
 
 add_custom_target(
         simple_test
-        COMMAND ./megahit --test -t 2
-        COMMAND MEGAHIT_NUM_MERCY_FACTOR=1.5 ./megahit --test -t 4 --mem-flag 0 --no-hw-accel
-        COMMAND ./megahit --test -t 2 --kmin-1pass --prune-level 3 --prune-depth 0
-        COMMAND rm -rf test-random && python3 ${TEST_DATA}/generate_random_fasta.py > random.fa && ./megahit -r random.fa --k-list 255 --min-count 1 -o test-random
-        COMMAND rm -rf test-fastg && ./megahit --test -t 2 --mem-flag 2 --keep-tmp-files -o test-fastg
-        COMMAND rm -rf test-empty && ./megahit -r ${TEST_DATA}/empty.fa -o test-empty
-        COMMAND rm -rf test-no-contig && ./megahit -r ${TEST_DATA}/r4.fa -o test-no-contig
-        COMMAND ./megahit_toolkit contig2fastg 59 test-fastg/intermediate_contigs/k59.contigs.fa > 59.fastg
-        COMMAND ./megahit_toolkit readstat < test-fastg/intermediate_contigs/k59.contigs.fa
+        COMMAND ./megahit --test -t 2 -o test-embedded --force
 )
 
-add_dependencies(megahit megahit_core megahit_core_popcnt megahit_core_no_hw_accel megahit_toolkit)
-add_dependencies(simple_test megahit)
+add_dependencies(simple_test embedded_megahit)
 
-install(TARGETS megahit_core megahit_core_popcnt megahit_core_no_hw_accel DESTINATION bin)
-install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/megahit ${CMAKE_CURRENT_BINARY_DIR}/megahit_toolkit DESTINATION bin)
+install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/megahit DESTINATION bin)
 install(DIRECTORY test_data DESTINATION share/${PROJECT_NAME})
