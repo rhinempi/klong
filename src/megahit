@@ -634,6 +634,12 @@ def graph_prefix(kmer_k):
     return os.path.join(opt.temp_dir, 'k' + str(kmer_k), str(kmer_k))
 
 
+def read_count_prefix(kmer_k):
+    output_dir = os.path.join(opt.temp_dir, 'k' + str(kmer_k), 'read_count')
+    mkdir_if_not_exists(output_dir)
+    return os.path.join(output_dir, str(kmer_k))
+
+
 def contig_prefix(kmer_k):
     return os.path.join(opt.contig_dir, 'k' + str(kmer_k))
 
@@ -784,6 +790,30 @@ def build_first_graph_1pass(option):
 def count_mink(option):
     cmd = [opt.megahit_core, 'count'] + option
     run_sub_command(cmd, 'Extract solid (k+1)-mers for k = %d ' % opt.k_min)
+
+
+@check_point
+def count_and_build_read_graph(kmer_k):
+    output_prefix = read_count_prefix(kmer_k)
+    count_opt = ['-k', str(kmer_k),
+                 '-m', str(opt.min_count),
+                 '--host_mem', str(opt.host_mem),
+                 '--mem_flag', str(opt.mem_flag),
+                 '--output_prefix', output_prefix,
+                 '--num_cpu_threads', str(opt.num_cpu_threads),
+                 '--read_lib_file', opt.read_lib_path]
+    run_sub_command([opt.megahit_core, 'count'] + count_opt,
+                    'Extract full read-counted solid (k+1)-mers for k = %d ' % kmer_k)
+
+    build_opt = ['--host_mem', str(opt.host_mem),
+                 '--mem_flag', str(opt.mem_flag),
+                 '--output_prefix', output_prefix,
+                 '--num_cpu_threads', str(opt.num_cpu_threads),
+                 '-k', str(kmer_k),
+                 '--kmer_from', '0',
+                 '--input_prefix', output_prefix]
+    run_sub_command([opt.megahit_core, 'seq2sdbg'] + build_opt,
+                    'Build full read-counted graph for k = %d ' % kmer_k)
 
 
 def build_first_graph():
@@ -1009,6 +1039,7 @@ def main(argv=None):
                     local_assemble(cur_k, next_k)
 
                 iterate(cur_k, k_step)
+                count_and_build_read_graph(next_k)
                 build_graph(next_k, cur_k)
 
                 assemble(next_k)
