@@ -39,6 +39,7 @@ int main_seq2sdbg(int argc, char **argv);
 int main_contig2fastg(int argc, char **argv);
 int main_read_stat(int argc, char **argv);
 int main_filter_by_len(int argc, char **argv);
+int main_prefix_bloom(int argc, char **argv);
 
 void show_help(const char *program_name) {
   pfprintf(
@@ -56,6 +57,7 @@ void show_help(const char *program_name) {
       "       readstat       calculate read stats (# of reads, bases, longest, "
       "shortest, average)\n"
       "       filterbylen    filter contigs by length\n"
+      "       prefixbf       Bloom-filter shorter k-mers represented by longer prefixes\n"
       "       checkcpu       check whether the run-time CPU supports POPCNT "
       "and BMI2\n"
       "       checkpopcnt    check whether the run-time CPU supports POPCNT\n"
@@ -91,6 +93,8 @@ int main(int argc, char **argv) {
     return main_read_stat(argc - 1, argv + 1);
   } else if (strcmp(argv[1], "filterbylen") == 0) {
     return main_filter_by_len(argc - 1, argv + 1);
+  } else if (strcmp(argv[1], "prefixbf") == 0) {
+    return main_prefix_bloom(argc - 1, argv + 1);
   } else if (strcmp(argv[1], "checkcpu") == 0) {
     pprintf("{}\n", HasPopcnt() && HasBmi2());
   } else if (strcmp(argv[1], "checkpopcnt") == 0) {

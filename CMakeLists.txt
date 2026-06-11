@@ -21,6 +21,7 @@ FILE(GLOB_RECURSE SDBG_SOURCE "src/sdbg/*.cpp")
 FILE(GLOB_RECURSE CX1_SOURCE "src/sorting/*.cpp")
 FILE(GLOB_RECURSE SEQ_SOURCE "src/sequence/*.cpp")
 FILE(GLOB_RECURSE TOOLKIT_SOURCE "src/tools/*.cpp")
+FILE(GLOB_RECURSE BLOOM_FILTER_SOURCE "bloom_filter/*.cpp")
 
 LIST(APPEND OTHER_SOURCE
         src/main.cpp
@@ -75,7 +76,8 @@ set(MEGAHIT_CORE_SOURCE
         ${LCASM_SOURCE}
         ${SEQ_SOURCE}
         ${CX1_SOURCE}
-        ${TOOLKIT_SOURCE})
+        ${TOOLKIT_SOURCE}
+        ${BLOOM_FILTER_SOURCE})
 
 add_executable(megahit_core ${MEGAHIT_CORE_SOURCE})
 

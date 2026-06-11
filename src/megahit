@@ -634,10 +634,14 @@ def graph_prefix(kmer_k):
     return os.path.join(opt.temp_dir, 'k' + str(kmer_k), str(kmer_k))
 
 
+def read_count_prefix_path(kmer_k):
+    return os.path.join(opt.temp_dir, 'k' + str(kmer_k), 'read_count', str(kmer_k))
+
+
 def read_count_prefix(kmer_k):
-    output_dir = os.path.join(opt.temp_dir, 'k' + str(kmer_k), 'read_count')
+    output_dir = os.path.dirname(read_count_prefix_path(kmer_k))
     mkdir_if_not_exists(output_dir)
-    return os.path.join(output_dir, str(kmer_k))
+    return read_count_prefix_path(kmer_k)
 
 
 def contig_prefix(kmer_k):
@@ -645,8 +649,6 @@ def contig_prefix(kmer_k):
 
 
 def remove_temp_after_build(kmer_k):
-    for i in range(opt.num_cpu_threads):
-        remove_if_exists(graph_prefix(kmer_k) + '.edges.' + str(i))
     for i in range(64):
         remove_if_exists(graph_prefix(kmer_k) + '.mercy_cand.' + str(i))
     for i in range(opt.num_cpu_threads):
@@ -814,6 +816,33 @@ def count_and_build_read_graph(kmer_k):
                  '--input_prefix', output_prefix]
     run_sub_command([opt.megahit_core, 'seq2sdbg'] + build_opt,
                     'Build full read-counted graph for k = %d ' % kmer_k)
+
+
+def report_short_kmers_represented_by_long_prefix(short_k, long_k):
+    short_prefix = read_count_prefix_path(short_k)
+    if not os.path.exists(short_prefix + '.edges.info'):
+        short_prefix = graph_prefix(short_k)
+
+    long_prefix = read_count_prefix_path(long_k)
+    if not os.path.exists(short_prefix + '.edges.info') or not os.path.exists(long_prefix + '.edges.info'):
+        logger.warning('Skip short/long k-mer prefix report for k = %d to %d: binary edge files missing',
+                       short_k, long_k)
+        return
+
+    output_prefix = os.path.join(os.path.dirname(long_prefix),
+                                 str(long_k) + '.short_k' + str(short_k) + '_prefix')
+    report_opt = ['--short_prefix', short_prefix,
+                  '--long_prefix', long_prefix,
+                  '--output_prefix', output_prefix,
+                  '--short_k', str(short_k),
+                  '--long_k', str(long_k),
+                  '--num_cpu_threads', str(opt.num_cpu_threads),
+                  '--max_bloom_gb', '30',
+                  '--reserve_gb', '1']
+    run_sub_command([opt.megahit_core, 'prefixbf'] + report_opt,
+                    'Bloom-filter shorter k-mers represented by longer prefixes for k = %d to %d ' %
+                    (short_k, long_k))
+
 
 
 def build_first_graph():
@@ -1040,6 +1069,7 @@ def main(argv=None):
 
                 iterate(cur_k, k_step)
                 count_and_build_read_graph(next_k)
+                report_short_kmers_represented_by_long_prefix(cur_k, next_k)
                 build_graph(next_k, cur_k)
 
                 assemble(next_k)
