@@ -19,6 +19,7 @@ class EdgeWriter {
   EdgeIoMetadata metadata_{};
   std::string file_prefix_;
   std::vector<std::unique_ptr<std::ofstream>> files_;
+  std::vector<std::unique_ptr<std::ofstream>> text_files_;
   std::vector<int64_t> n_edges_at_thread_;
 
   bool is_opened_;
@@ -60,6 +61,10 @@ class EdgeWriter {
       files_.emplace_back(new std::ofstream(
           (file_prefix_ + ".edges." + std::to_string(i)).c_str(),
           std::ofstream::binary | std::ofstream::out));
+      text_files_.emplace_back(new std::ofstream(
+          (file_prefix_ + ".edges." + std::to_string(i) + ".txt").c_str(),
+          std::ofstream::out));
+      *text_files_.back() << "#edge\tmultiplicity\n";
     }
 
     is_opened_ = true;
@@ -80,6 +85,7 @@ class EdgeWriter {
 
     files_[tid]->write(reinterpret_cast<const char *>(edge_ptr),
                        sizeof(uint32_t) * metadata_.words_per_edge);
+    WriteText(edge_ptr, tid);
     ++snapshot->bucket_info.total_number;
   }
 
@@ -95,6 +101,7 @@ class EdgeWriter {
     assert(!metadata_.is_sorted);
     files_[0]->write(reinterpret_cast<const char *>(edge_ptr),
                      sizeof(uint32_t) * metadata_.words_per_edge);
+    WriteText(edge_ptr, 0);
     ++metadata_.num_edges;
   }
 
@@ -103,11 +110,32 @@ class EdgeWriter {
       for (auto &file : files_) {
         file->close();
       }
+      for (auto &file : text_files_) {
+        file->close();
+      }
       std::ofstream info_file(file_prefix_ + ".edges.info");
       metadata_.Serialize(info_file);
       info_file.close();
       is_opened_ = false;
     }
+  }
+
+ private:
+  static char DecodeBase(uint32_t *edge_ptr, unsigned index) {
+    static const char bases[] = {'A', 'C', 'G', 'T'};
+    unsigned word = index / kCharsPerEdgeWord;
+    unsigned offset = index % kCharsPerEdgeWord;
+    unsigned shift = (kCharsPerEdgeWord - 1 - offset) * kBitsPerEdgeChar;
+    return bases[(edge_ptr[word] >> shift) & kEdgeCharMask];
+  }
+
+  void WriteText(uint32_t *edge_ptr, int tid) const {
+    assert(tid >= 0 && tid < static_cast<int>(text_files_.size()));
+    auto &out = *text_files_[tid];
+    for (unsigned i = 0; i < metadata_.kmer_size + 1; ++i) {
+      out << DecodeBase(edge_ptr, i);
+    }
+    out << '\t' << (edge_ptr[metadata_.words_per_edge - 1] & kMaxMul) << '\n';
   }
 };
 
