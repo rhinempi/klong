@@ -926,6 +926,7 @@ def merge_contig_edges_into_next_k(short_k, long_k):
                  '--long_prefix', long_prefix,
                  '--output_prefix', output_prefix,
                  '--contig', contig_prefix(short_k) + '.contigs.fa',
+                 '--short_k', str(short_k),
                  '--long_k', str(long_k),
                  '--num_cpu_threads', str(opt.num_cpu_threads)]
     run_sub_command([opt.megahit_core, 'prefixbf'] + merge_opt,
