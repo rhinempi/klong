@@ -68,10 +68,13 @@ class EdgeReader : public BaseSequenceReader {
   std::vector<std::unique_ptr<std::ifstream>> in_streams_;
   BufferedReader cur_reader_;
   std::vector<uint32_t> buffer_;
+  std::vector<int64_t> unsorted_file_records_;
 
   int cur_bucket_{};
+  int cur_file_{};
   int64_t cur_cnt_{};
   int64_t cur_vol_{};
+  int64_t total_unsorted_read_{};
   bool is_opened_{false};
 
   EdgeIoMetadata metadata_;
@@ -82,16 +85,26 @@ class EdgeReader : public BaseSequenceReader {
     buffer_.resize(metadata_.words_per_edge);
 
     for (unsigned i = 0; i < metadata_.num_files; ++i) {
+      auto file_name = file_prefix_ + ".edges." + std::to_string(i);
       in_streams_.emplace_back(
-          new std::ifstream(file_prefix_ + ".edges." + std::to_string(i),
-                            std::ifstream::binary | std::ifstream::in));
+          new std::ifstream(file_name, std::ifstream::binary | std::ifstream::in));
+      if (!metadata_.is_sorted) {
+        std::ifstream size_stream(file_name,
+                                  std::ifstream::binary | std::ifstream::ate);
+        unsorted_file_records_.push_back(
+            static_cast<int64_t>(size_stream.tellg()) /
+            static_cast<int64_t>(sizeof(uint32_t) * metadata_.words_per_edge));
+      }
     }
 
     cur_cnt_ = 0;
     cur_vol_ = 0;
     cur_bucket_ = -1;
+    cur_file_ = 0;
+    total_unsorted_read_ = 0;
 
-    if (!metadata_.is_sorted) {
+    if (!metadata_.is_sorted && !in_streams_.empty()) {
+      cur_vol_ = unsorted_file_records_.empty() ? 0 : unsorted_file_records_[0];
       cur_reader_.reset(in_streams_[0].get());
     }
 
@@ -138,11 +151,23 @@ class EdgeReader : public BaseSequenceReader {
   }
 
   uint32_t *NextUnsortedEdge() {
-    if (cur_cnt_ >= metadata_.num_edges) {
+    if (total_unsorted_read_ >= metadata_.num_edges) {
       return nullptr;
     }
 
+    while (cur_file_ < static_cast<int>(metadata_.num_files) &&
+           cur_cnt_ >= cur_vol_) {
+      ++cur_file_;
+      cur_cnt_ = 0;
+      if (cur_file_ >= static_cast<int>(metadata_.num_files)) {
+        return nullptr;
+      }
+      cur_vol_ = unsorted_file_records_[cur_file_];
+      cur_reader_.reset(in_streams_[cur_file_].get());
+    }
+
     ++cur_cnt_;
+    ++total_unsorted_read_;
     auto n_read = cur_reader_.read(buffer_.data(), metadata_.words_per_edge);
     assert(n_read == metadata_.words_per_edge * sizeof(uint32_t));
     (void)n_read;

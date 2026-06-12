@@ -189,6 +189,7 @@ class Options:
         self.mem_flag = 1
         self.out_prefix = ''
         self.kmin_1pass = False
+        self.debug_assembly = False
         self.pe1 = []
         self.pe2 = []
         self.pe12 = []
@@ -300,6 +301,7 @@ def parse_option(argv):
                                     'min-contig-len=',
                                     'num-cpu-threads=',
                                     'kmin-1pass',
+                                    'debug-assembly',
                                     'k-min=',
                                     'k-max=',
                                     'k-step=',
@@ -352,6 +354,8 @@ def parse_option(argv):
             opt.num_cpu_threads = int(value)
         elif option == '--kmin-1pass':
             opt.kmin_1pass = True
+        elif option == '--debug-assembly':
+            opt.debug_assembly = True
         elif option == '--k-min':
             opt.k_min = int(value)
             opt.set_list_by_min_max_step = True
@@ -639,9 +643,48 @@ def read_count_prefix_path(kmer_k):
 
 
 def read_count_prefix(kmer_k):
+    mkdir_if_not_exists(os.path.join(opt.temp_dir, 'k' + str(kmer_k)))
     output_dir = os.path.dirname(read_count_prefix_path(kmer_k))
     mkdir_if_not_exists(output_dir)
     return read_count_prefix_path(kmer_k)
+
+
+def reduced_edge_prefix(kmer_k):
+    output_dir = os.path.join(opt.temp_dir, 'k' + str(kmer_k), 'reduced_edges')
+    mkdir_if_not_exists(output_dir)
+    return os.path.join(output_dir, str(kmer_k))
+
+
+def merged_edge_prefix(kmer_k):
+    output_dir = os.path.join(opt.temp_dir, 'k' + str(kmer_k), 'merged_edges')
+    mkdir_if_not_exists(output_dir)
+    return os.path.join(output_dir, str(kmer_k))
+
+
+def assembly_graph_prefix(kmer_k):
+    output_dir = os.path.join(opt.temp_dir, 'k' + str(kmer_k), 'assembly_graph')
+    mkdir_if_not_exists(output_dir)
+    return os.path.join(output_dir, str(kmer_k))
+
+
+def edge_prefix_exists(prefix):
+    return os.path.exists(prefix + '.edges.info')
+
+
+def original_edge_prefix(kmer_k):
+    if kmer_k == opt.k_min:
+        return graph_prefix(kmer_k)
+    return read_count_prefix_path(kmer_k)
+
+
+def current_edge_prefix(kmer_k):
+    merged = merged_edge_prefix(kmer_k)
+    if edge_prefix_exists(merged):
+        return merged
+    reduced = reduced_edge_prefix(kmer_k)
+    if edge_prefix_exists(reduced):
+        return reduced
+    return original_edge_prefix(kmer_k)
 
 
 def contig_prefix(kmer_k):
@@ -818,20 +861,47 @@ def count_and_build_read_graph(kmer_k):
                     'Build full read-counted graph for k = %d ' % kmer_k)
 
 
-def report_short_kmers_represented_by_long_prefix(short_k, long_k):
-    short_prefix = read_count_prefix_path(short_k)
-    if not os.path.exists(short_prefix + '.edges.info'):
-        short_prefix = graph_prefix(short_k)
+def remove_edge_prefix(prefix):
+    directory = os.path.dirname(prefix)
+    base = os.path.basename(prefix) + '.edges.'
+    if os.path.exists(directory):
+        for name in os.listdir(directory):
+            if name.startswith(base):
+                remove_if_exists(os.path.join(directory, name))
+    remove_if_exists(prefix + '.edges.info')
 
+
+def promote_edge_prefix(tmp_prefix, final_prefix):
+    remove_edge_prefix(final_prefix)
+    directory = os.path.dirname(tmp_prefix)
+    tmp_base = os.path.basename(tmp_prefix) + '.edges.'
+    final_base = os.path.basename(final_prefix) + '.edges.'
+    for name in os.listdir(directory):
+        if not name.startswith(tmp_base):
+            continue
+        suffix = name[len(tmp_base):]
+        # Move only real edge shards (for example .0 or .0.txt); metadata is
+        # promoted after all shards so the graph prefix is complete atomically.
+        shard_id = suffix[:-4] if suffix.endswith('.txt') else suffix
+        if not shard_id.isdigit():
+            continue
+        os.rename(os.path.join(directory, name),
+                  os.path.join(directory, final_base + suffix))
+    os.rename(tmp_prefix + '.edges.info', final_prefix + '.edges.info')
+
+
+def reduce_edges_for_k(short_k, long_k):
+    short_prefix = current_edge_prefix(short_k)
     long_prefix = read_count_prefix_path(long_k)
-    if not os.path.exists(short_prefix + '.edges.info') or not os.path.exists(long_prefix + '.edges.info'):
-        logger.warning('Skip short/long k-mer prefix report for k = %d to %d: binary edge files missing',
+    if not edge_prefix_exists(short_prefix) or not edge_prefix_exists(long_prefix):
+        logger.warning('Skip edge reduction for k = %d using k = %d: binary edge files missing',
                        short_k, long_k)
-        return
+        return None
 
-    output_prefix = os.path.join(os.path.dirname(long_prefix),
-                                 str(long_k) + '.short_k' + str(short_k) + '_prefix')
-    report_opt = ['--short_prefix', short_prefix,
+    output_prefix = reduced_edge_prefix(short_k)
+    remove_edge_prefix(output_prefix)
+    reduce_opt = ['--mode', 'reduce',
+                  '--short_prefix', short_prefix,
                   '--long_prefix', long_prefix,
                   '--output_prefix', output_prefix,
                   '--short_k', str(short_k),
@@ -839,10 +909,44 @@ def report_short_kmers_represented_by_long_prefix(short_k, long_k):
                   '--num_cpu_threads', str(opt.num_cpu_threads),
                   '--max_bloom_gb', '60',
                   '--reserve_gb', '1']
-    run_sub_command([opt.megahit_core, 'prefixbf'] + report_opt,
-                    'Bloom-filter shorter k-mers represented by longer prefixes for k = %d to %d ' %
-                    (short_k, long_k))
+    run_sub_command([opt.megahit_core, 'prefixbf'] + reduce_opt,
+                    'Reduce edges for k = %d using k = %d ' % (short_k, long_k))
+    return output_prefix
 
+
+def merge_contig_edges_into_next_k(short_k, long_k):
+    long_prefix = read_count_prefix_path(long_k)
+    if not edge_prefix_exists(long_prefix):
+        logger.warning('Skip edge merge for k = %d: read-counted edge files missing', long_k)
+        return None
+
+    output_prefix = merged_edge_prefix(long_k)
+    remove_edge_prefix(output_prefix)
+    merge_opt = ['--mode', 'merge',
+                 '--long_prefix', long_prefix,
+                 '--output_prefix', output_prefix,
+                 '--contig', contig_prefix(short_k) + '.contigs.fa',
+                 '--long_k', str(long_k),
+                 '--num_cpu_threads', str(opt.num_cpu_threads)]
+    run_sub_command([opt.megahit_core, 'prefixbf'] + merge_opt,
+                    'Merge k = %d assembly edges into k = %d ' % (short_k, long_k))
+    return output_prefix
+
+
+def build_graph_from_edge_prefix(kmer_k, input_prefix=None):
+    if input_prefix is None:
+        input_prefix = current_edge_prefix(kmer_k)
+    output_prefix = assembly_graph_prefix(kmer_k)
+    build_opt = ['--host_mem', str(opt.host_mem),
+                 '--mem_flag', str(opt.mem_flag),
+                 '--output_prefix', output_prefix,
+                 '--num_cpu_threads', str(opt.num_cpu_threads),
+                 '-k', str(kmer_k),
+                 '--kmer_from', '0',
+                 '--input_prefix', input_prefix]
+    run_sub_command([opt.megahit_core, 'seq2sdbg'] + build_opt,
+                    'Build graph for k = %d from %s ' % (kmer_k, input_prefix))
+    return output_prefix
 
 
 def build_first_graph():
@@ -854,11 +958,9 @@ def build_first_graph():
                      '--num_cpu_threads', str(opt.num_cpu_threads),
                      '--read_lib_file', opt.read_lib_path]
 
-    if not opt.kmin_1pass:
-        count_mink(common_option)
-        build_graph(opt.k_min, 0)
-    else:
-        build_first_graph_1pass(common_option)
+    if opt.kmin_1pass:
+        logger.warning('Reduced-edge iteration ignores --kmin-1pass and counts k-min edges first')
+    count_mink(common_option)
 
 
 @check_point
@@ -922,32 +1024,50 @@ def iterate(cur_k, step):
 
 
 @check_point
-def assemble(cur_k):
-    min_standalone = max(min(opt.k_max * 3 - 1, int(opt.min_contig_len * 1.5)), opt.min_contig_len)
-    if opt.max_tip_len >= 0:
-        min_standalone = max(opt.max_tip_len + opt.k_max - 1, opt.min_contig_len)
+def assemble(cur_k, graph_input_prefix=None, next_k=None):
+    debug_no_prune = opt.debug_assembly and next_k is not None
+    if debug_no_prune:
+        min_standalone = 0
+        prune_level = 0
+        merge_len = 0
+        bubble_level = 0
+        cleaning_rounds = 1
+        min_depth = 0
+        max_tip_len = 0
+        logger.warning('Debug assembly for k = %d: pruning and next-k length threshold disabled', cur_k)
+    else:
+        min_standalone = max(min(opt.k_max * 3 - 1, int(opt.min_contig_len * 1.5)), opt.min_contig_len)
+        if opt.max_tip_len >= 0:
+            min_standalone = max(opt.max_tip_len + opt.k_max - 1, opt.min_contig_len)
+        prune_level = opt.prune_level
+        merge_len = int(opt.merge_len)
+        bubble_level = opt.bubble_level
+        cleaning_rounds = opt.cleaning_rounds
+        min_depth = opt.prune_depth
+        if opt.max_tip_len == -1 and cur_k * 3 - 1 > opt.min_contig_len * 1.5:
+            max_tip_len = max(1, opt.min_contig_len * 1.5 + 1 - cur_k)
+        else:
+            max_tip_len = opt.max_tip_len
+
+    if graph_input_prefix is None:
+        graph_input_prefix = assembly_graph_prefix(cur_k)
 
     assembly_cmd = [opt.megahit_core, 'assemble',
-                    '-s', graph_prefix(cur_k),
+                    '-s', graph_input_prefix,
                     '-o', contig_prefix(cur_k),
                     '-t', str(opt.num_cpu_threads),
                     '--min_standalone', str(min_standalone),
-                    '--prune_level', str(opt.prune_level),
-                    '--merge_len', str(int(opt.merge_len)),
+                    '--prune_level', str(prune_level),
+                    '--merge_len', str(merge_len),
                     '--merge_similar', str(opt.merge_similar),
-                    '--cleaning_rounds', str(opt.cleaning_rounds),
+                    '--cleaning_rounds', str(cleaning_rounds),
                     '--disconnect_ratio', str(opt.disconnect_ratio),
                     '--low_local_ratio', str(opt.low_local_ratio),
-                    '--cleaning_rounds', str(opt.cleaning_rounds),
-                    '--min_depth', str(opt.prune_depth),
-                    '--bubble_level', str(opt.bubble_level)]
+                    '--min_depth', str(min_depth),
+                    '--bubble_level', str(bubble_level),
+                    '--max_tip_len', str(max_tip_len)]
 
-    if opt.max_tip_len == -1 and cur_k * 3 - 1 > opt.min_contig_len * 1.5:
-        assembly_cmd += ['--max_tip_len', str(max(1, opt.min_contig_len * 1.5 + 1 - cur_k))]
-    else:
-        assembly_cmd += ['--max_tip_len', str(opt.max_tip_len)]
-
-    if cur_k < opt.k_max:
+    if cur_k < opt.k_max and not debug_no_prune:
         assembly_cmd.append('--careful_bubble')
 
     if cur_k == opt.k_max:
@@ -1053,27 +1173,20 @@ def main(argv=None):
         logger.info('Memory used: %d' % opt.host_mem)
 
         build_first_graph()
-        assemble(opt.k_min)
-
-        cur_k = opt.k_min
-        next_k_idx = 0
 
         try:
-            while cur_k < opt.k_max:
-                next_k_idx += 1
+            for next_k_idx in range(1, len(opt.k_list)):
+                cur_k = opt.k_list[next_k_idx - 1]
                 next_k = opt.k_list[next_k_idx]
-                k_step = next_k - cur_k
 
-                if not opt.no_local:
-                    local_assemble(cur_k, next_k)
-
-                iterate(cur_k, k_step)
                 count_and_build_read_graph(next_k)
-                report_short_kmers_represented_by_long_prefix(cur_k, next_k)
-                build_graph(next_k, cur_k)
+                reduced_prefix = reduce_edges_for_k(cur_k, next_k)
+                graph_input = build_graph_from_edge_prefix(cur_k, reduced_prefix)
+                assemble(cur_k, graph_input, next_k)
+                merge_contig_edges_into_next_k(cur_k, next_k)
 
-                assemble(next_k)
-                cur_k = next_k
+            graph_input = build_graph_from_edge_prefix(opt.k_max, current_edge_prefix(opt.k_max))
+            assemble(opt.k_max, graph_input)
             merge_final(opt.k_max)
 
         except EarlyTerminate as et:
