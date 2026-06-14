@@ -12,6 +12,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -94,6 +95,11 @@ struct OverlapEntry {
   OverlapEntry(const KmerKey &key_in, uint32_t id_in) : key(key_in), id(id_in) {}
 };
 
+struct LongEdgeOrigin {
+  std::string edge;
+  std::string side;
+};
+
 struct OverlapEntryLess {
   bool operator()(const OverlapEntry &lhs, const OverlapEntry &rhs) const {
     int cmp = CompareKeys(lhs.key, rhs.key);
@@ -149,6 +155,16 @@ KmerKey RawKeyFromEdge(const uint32_t *edge, unsigned offset, unsigned len) {
   KmerKey key;
   for (unsigned i = 0; i < len; ++i) {
     SetPackedBase(&key, i, GetBase(edge, offset + i));
+  }
+  return key;
+}
+
+KmerKey RawReverseComplementKeyFromEdge(const uint32_t *edge, unsigned offset,
+                                        unsigned len) {
+  KmerKey key;
+  for (unsigned i = 0; i < len; ++i) {
+    SetPackedBase(&key, i,
+                  static_cast<uint8_t>(3 - GetBase(edge, offset + len - 1 - i)));
   }
   return key;
 }
@@ -494,13 +510,24 @@ int RunReduce(const Options &opt) {
                               ChooseHashCount(bloom_bytes * 8,
                                               std::max<uint64_t>(1, bloom_insertions),
                                               opt.max_hashes));
+  std::unordered_map<KmerKey, std::vector<LongEdgeOrigin>, KmerKeyHash> longer_origin;
 
 #pragma omp parallel for schedule(dynamic) num_threads(opt.num_threads)
   for (int file_id = 0; file_id < static_cast<int>(long_meta.num_files); ++file_id) {
     ForEachEdgeInFile(opt.long_prefix, long_meta, file_id, [&](const uint32_t *edge) {
-      longer_prefixes.Add(CanonicalKeyFromEdge(edge, 0, short_edge_len));
-      longer_prefixes.Add(CanonicalKeyFromEdge(edge, long_edge_len - short_edge_len,
-                                               short_edge_len));
+      KmerKey prefix_key = RawKeyFromEdge(edge, 0, short_edge_len);
+      KmerKey rc_prefix_key = RawReverseComplementKeyFromEdge(
+          edge, long_edge_len - short_edge_len, short_edge_len);
+      longer_prefixes.Add(prefix_key);
+      longer_prefixes.Add(rc_prefix_key);
+      std::string long_edge = BasesFromEdge(edge, 0, long_edge_len);
+      std::string rc_long_edge = ReverseComplement(long_edge);
+#pragma omp critical(longer_origin_insert)
+      {
+        longer_origin[prefix_key].push_back(LongEdgeOrigin{long_edge, "prefix"});
+        longer_origin[rc_prefix_key].push_back(
+            LongEdgeOrigin{rc_long_edge, "reverse_complement_prefix"});
+      }
     });
   }
 
@@ -510,6 +537,9 @@ int RunReduce(const Options &opt) {
                           opt.num_threads);
   std::atomic<uint64_t> kept{0};
   std::atomic<uint64_t> removed{0};
+  std::atomic<uint64_t> forward_only{0};
+  std::atomic<uint64_t> reverse_only{0};
+  std::atomic<uint64_t> no_orientation_hit{0};
 
 #pragma omp parallel for schedule(dynamic) num_threads(opt.num_threads)
   for (int file_id = 0; file_id < static_cast<int>(short_meta.num_files); ++file_id) {
@@ -519,18 +549,59 @@ int RunReduce(const Options &opt) {
 #endif
     std::vector<std::vector<uint32_t>> local_kept;
     ForEachEdgeInFile(opt.short_prefix, short_meta, file_id, [&](const uint32_t *edge) {
-      KmerKey key = CanonicalKeyFromEdge(edge, 0, short_edge_len);
-      if (longer_prefixes.Contains(key)) {
+      KmerKey forward_key = RawKeyFromEdge(edge, 0, short_edge_len);
+      KmerKey reverse_key = RawReverseComplementKeyFromEdge(edge, 0, short_edge_len);
+      bool forward_hit = longer_prefixes.Contains(forward_key);
+      bool reverse_hit = longer_prefixes.Contains(reverse_key);
+      if (forward_hit && reverse_hit) {
         ++removed;
-        removed_buffers[tid] << BasesFromEdge(edge, 0, short_edge_len) << '\t'
-                             << Multiplicity(edge, short_meta.words_per_edge) << '\t'
-                             << "represented_by_longer_edge_prefix" << '\n';
+        auto forward_origin_it = longer_origin.find(forward_key);
+        auto reverse_origin_it = longer_origin.find(reverse_key);
+        bool wrote_origin = false;
+        if (forward_origin_it != longer_origin.end() &&
+            !forward_origin_it->second.empty()) {
+          for (const auto &origin : forward_origin_it->second) {
+            removed_buffers[tid] << BasesFromEdge(edge, 0, short_edge_len) << '\t'
+                                 << Multiplicity(edge, short_meta.words_per_edge) << '\t'
+                                 << "forward_represented_by_longer_edge_"
+                                 << origin.side << '\t'
+                                 << origin.edge << '\n';
+            wrote_origin = true;
+          }
+        }
+        if (reverse_origin_it != longer_origin.end() &&
+            !reverse_origin_it->second.empty()) {
+          for (const auto &origin : reverse_origin_it->second) {
+            removed_buffers[tid] << BasesFromEdge(edge, 0, short_edge_len) << '\t'
+                                 << Multiplicity(edge, short_meta.words_per_edge) << '\t'
+                                 << "reverse_complement_represented_by_longer_edge_"
+                                 << origin.side << '\t'
+                                 << origin.edge << '\n';
+            wrote_origin = true;
+          }
+        }
+        if (!wrote_origin) {
+          removed_buffers[tid] << BasesFromEdge(edge, 0, short_edge_len) << '\t'
+                               << Multiplicity(edge, short_meta.words_per_edge) << '\t'
+                               << "both_orientations_represented_by_longer_edge" << '\t'
+                               << "NA" << '\n';
+        }
       } else {
         ++kept;
+        const char *keep_reason = "no_orientation_hit";
+        if (forward_hit) {
+          ++forward_only;
+          keep_reason = "forward_only_hit";
+        } else if (reverse_hit) {
+          ++reverse_only;
+          keep_reason = "reverse_complement_only_hit";
+        } else {
+          ++no_orientation_hit;
+        }
         local_kept.push_back(std::vector<uint32_t>(edge, edge + short_meta.words_per_edge));
         non_removed_buffers[tid] << BasesFromEdge(edge, 0, short_edge_len) << '\t'
                                  << Multiplicity(edge, short_meta.words_per_edge) << '\t'
-                                 << "non_removed" << '\n';
+                                 << keep_reason << '\n';
       }
     });
     for (const auto &edge : local_kept) writer.Write(edge.data(), tid, "non_removed");
@@ -538,7 +609,7 @@ int RunReduce(const Options &opt) {
   writer.Finalize();
 
   std::ofstream removed_out(opt.output_prefix + ".removed.txt");
-  removed_out << "#edge\tmultiplicity\treason\n";
+  removed_out << "#edge\tmultiplicity\treason\tmatched_long_edge\n";
   for (auto &buf : removed_buffers) removed_out << buf.str();
 
   std::ofstream non_removed_out(opt.output_prefix + ".non_removed.txt");
@@ -556,6 +627,9 @@ int RunReduce(const Options &opt) {
   summary << "long_edge_records\t" << long_records << '\n';
   summary << "removed_short_edges\t" << removed.load() << '\n';
   summary << "non_removed_short_edges\t" << kept.load() << '\n';
+  summary << "non_removed_forward_only_hits\t" << forward_only.load() << '\n';
+  summary << "non_removed_reverse_complement_only_hits\t" << reverse_only.load() << '\n';
+  summary << "non_removed_no_orientation_hits\t" << no_orientation_hit.load() << '\n';
   summary << "bloom_insertions\t" << bloom_insertions << '\n';
   summary << "bloom_bits\t" << longer_prefixes.num_bits() << '\n';
   summary << "bloom_bytes\t" << longer_prefixes.num_bytes() << '\n';
@@ -564,7 +638,7 @@ int RunReduce(const Options &opt) {
           << std::setprecision(12)
           << EstimateFpr(longer_prefixes.num_bits(), bloom_insertions,
                          longer_prefixes.num_hashes()) << '\n';
-  summary << "representation\tbinary_short_edges_reduced_by_long_edge_prefixes\n";
+  summary << "representation\tbinary_short_edges_reduced_by_raw_long_edge_and_reverse_complement_prefixes_both_short_orientations_required\n";
   return 0;
 }
 
