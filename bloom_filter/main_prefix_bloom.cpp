@@ -221,6 +221,25 @@ std::string ReverseComplement(const std::string &seq) {
   return rc;
 }
 
+std::string ReverseString(const std::string &seq) {
+  return std::string(seq.rbegin(), seq.rend());
+}
+
+std::string ComplementString(const std::string &seq) {
+  std::string comp;
+  comp.reserve(seq.size());
+  for (char c : seq) {
+    switch (c) {
+      case 'A': case 'a': comp.push_back('T'); break;
+      case 'C': case 'c': comp.push_back('G'); break;
+      case 'G': case 'g': comp.push_back('C'); break;
+      case 'T': case 't': comp.push_back('A'); break;
+      default: comp.push_back('N'); break;
+    }
+  }
+  return comp;
+}
+
 std::string BasesFromEdge(const uint32_t *edge, unsigned offset, unsigned len) {
   static const char bases[] = {'A', 'C', 'G', 'T'};
   std::string s;
@@ -810,9 +829,10 @@ int RunMerge(const Options &opt) {
     std::string name, seq;
     while (ReadNextFasta(&contigs, &name, &seq)) {
       ++contig_seen;
-      process_contig_orientation(name, seq, "/fwd");
-      std::string rc = ReverseComplement(seq);
-      if (rc != seq) process_contig_orientation(name, rc, "/rc");
+      std::string rev = ReverseString(seq);
+      process_contig_orientation(name, rev, "/rev");
+      std::string comp = ComplementString(seq);
+      if (comp != rev) process_contig_orientation(name, comp, "/comp");
     }
   }
   writer.Finalize();
@@ -835,6 +855,7 @@ int RunMerge(const Options &opt) {
   summary << "index_build_threads\t" << index_threads << '\n';
   summary << "contigs_seen\t" << contig_seen << '\n';
   summary << "contig_orientations_scanned\t" << contig_orientations << '\n';
+  summary << "contig_orientation_modes\trev,comp\n";
   summary << "overlap_matches\t" << overlap_matches << '\n';
   summary << "extended_windows_seen\t" << extended_windows_seen << '\n';
   summary << "extended_edges_added\t" << extended_edges_added << '\n';

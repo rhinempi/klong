@@ -691,6 +691,73 @@ def contig_prefix(kmer_k):
     return os.path.join(opt.contig_dir, 'k' + str(kmer_k))
 
 
+def pruned_short_contig_file(kmer_k, next_k):
+    return contig_prefix(kmer_k) + '.lt_k%d_plus1.contigs.fa' % next_k
+
+
+def pruned_long_contig_file(kmer_k, next_k):
+    return contig_prefix(kmer_k) + '.ge_k%d_plus1.contigs.fa' % next_k
+
+
+def split_contigs_by_next_k(cur_k, next_k):
+    input_file = contig_prefix(cur_k) + '.contigs.fa'
+    short_file = pruned_short_contig_file(cur_k, next_k)
+    long_file = pruned_long_contig_file(cur_k, next_k)
+    threshold = next_k + 1
+
+    short_count = 0
+    short_bases = 0
+    long_count = 0
+    long_bases = 0
+
+    def write_record(out, header, seq):
+        out.write(header)
+        if not header.endswith('\n'):
+            out.write('\n')
+        out.write(seq + '\n')
+
+    with open(short_file, 'w') as short_out, open(long_file, 'w') as long_out:
+        if not os.path.exists(input_file):
+            logger.warning('Skip contig split for k = %d: %s missing',
+                           cur_k, input_file)
+            return short_file, long_file
+
+        header = None
+        seq_chunks = []
+        with open(input_file) as in_contigs:
+            for line in in_contigs:
+                if line.startswith('>'):
+                    if header is not None:
+                        seq = ''.join(seq_chunks)
+                        if len(seq) < threshold:
+                            write_record(short_out, header, seq)
+                            short_count += 1
+                            short_bases += len(seq)
+                        else:
+                            write_record(long_out, header, seq)
+                            long_count += 1
+                            long_bases += len(seq)
+                    header = line
+                    seq_chunks = []
+                else:
+                    seq_chunks.append(line.strip())
+
+        if header is not None:
+            seq = ''.join(seq_chunks)
+            if len(seq) < threshold:
+                write_record(short_out, header, seq)
+                short_count += 1
+                short_bases += len(seq)
+            else:
+                write_record(long_out, header, seq)
+                long_count += 1
+                long_bases += len(seq)
+
+    logger.info('Split k = %d contigs at length %d: short %d contigs/%d bp, long %d contigs/%d bp',
+                cur_k, threshold, short_count, short_bases, long_count, long_bases)
+    return short_file, long_file
+
+
 def remove_temp_after_build(kmer_k):
     for i in range(64):
         remove_if_exists(graph_prefix(kmer_k) + '.mercy_cand.' + str(i))
@@ -920,12 +987,18 @@ def merge_contig_edges_into_next_k(short_k, long_k):
         logger.warning('Skip edge merge for k = %d: read-counted edge files missing', long_k)
         return None
 
+    merge_contigs = pruned_short_contig_file(short_k, long_k)
+    if not os.path.exists(merge_contigs):
+        logger.warning('Short pruned contig file %s missing; falling back to %s',
+                       merge_contigs, contig_prefix(short_k) + '.contigs.fa')
+        merge_contigs = contig_prefix(short_k) + '.contigs.fa'
+
     output_prefix = merged_edge_prefix(long_k)
     remove_edge_prefix(output_prefix)
     merge_opt = ['--mode', 'merge',
                  '--long_prefix', long_prefix,
                  '--output_prefix', output_prefix,
-                 '--contig', contig_prefix(short_k) + '.contigs.fa',
+                 '--contig', merge_contigs,
                  '--short_k', str(short_k),
                  '--long_k', str(long_k),
                  '--num_cpu_threads', str(opt.num_cpu_threads)]
@@ -1026,8 +1099,8 @@ def iterate(cur_k, step):
 
 @check_point
 def assemble(cur_k, graph_input_prefix=None, next_k=None):
-    debug_no_prune = opt.debug_assembly and next_k is not None
-    if debug_no_prune:
+    preserve_intermediate_contigs = next_k is not None
+    if preserve_intermediate_contigs:
         min_standalone = 0
         prune_level = 0
         merge_len = 0
@@ -1035,7 +1108,10 @@ def assemble(cur_k, graph_input_prefix=None, next_k=None):
         cleaning_rounds = 1
         min_depth = 0
         max_tip_len = 0
-        logger.warning('Debug assembly for k = %d: pruning and next-k length threshold disabled', cur_k)
+        if opt.debug_assembly:
+            logger.warning('Debug assembly for k = %d: pruning and next-k length threshold disabled', cur_k)
+        else:
+            logger.info('Intermediate assembly for k = %d: pruning disabled so short contigs can be split before merge', cur_k)
     else:
         min_standalone = max(min(opt.k_max * 3 - 1, int(opt.min_contig_len * 1.5)), opt.min_contig_len)
         if opt.max_tip_len >= 0:
@@ -1068,7 +1144,7 @@ def assemble(cur_k, graph_input_prefix=None, next_k=None):
                     '--bubble_level', str(bubble_level),
                     '--max_tip_len', str(max_tip_len)]
 
-    if cur_k < opt.k_max and not debug_no_prune:
+    if cur_k < opt.k_max and not preserve_intermediate_contigs:
         assembly_cmd.append('--careful_bubble')
 
     if cur_k == opt.k_max:
@@ -1078,6 +1154,9 @@ def assemble(cur_k, graph_input_prefix=None, next_k=None):
         assembly_cmd.append('--output_standalone')
 
     run_sub_command(assembly_cmd, 'Assemble contigs from SdBG for k = %d' % cur_k)
+
+    if next_k is not None:
+        split_contigs_by_next_k(cur_k, next_k)
 
     if (not opt.keep_tmp_files) and (cur_k != opt.k_max):
         remove_temp_after_assemble(cur_k)
