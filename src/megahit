@@ -993,6 +993,12 @@ def merge_contig_edges_into_next_k(short_k, long_k):
                        merge_contigs, contig_prefix(short_k) + '.contigs.fa')
         merge_contigs = contig_prefix(short_k) + '.contigs.fa'
 
+    merge_long_contigs = pruned_long_contig_file(short_k, long_k)
+    if not os.path.exists(merge_long_contigs):
+        logger.warning('Long pruned contig file %s missing; long-contig edge scan disabled',
+                       merge_long_contigs)
+        merge_long_contigs = None
+
     output_prefix = merged_edge_prefix(long_k)
     remove_edge_prefix(output_prefix)
     merge_opt = ['--mode', 'merge',
@@ -1002,6 +1008,8 @@ def merge_contig_edges_into_next_k(short_k, long_k):
                  '--short_k', str(short_k),
                  '--long_k', str(long_k),
                  '--num_cpu_threads', str(opt.num_cpu_threads)]
+    if merge_long_contigs is not None:
+        merge_opt += ['--long_contig', merge_long_contigs]
     run_sub_command([opt.megahit_core, 'prefixbf'] + merge_opt,
                     'Merge k = %d assembly edges into k = %d ' % (short_k, long_k))
     return output_prefix

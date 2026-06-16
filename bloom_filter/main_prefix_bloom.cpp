@@ -37,6 +37,7 @@ struct Options {
   std::string long_prefix;
   std::string output_prefix;
   std::string contig_file;
+  std::string long_contig_file;
   unsigned short_k{0};
   unsigned long_k{0};
   int num_threads{1};
@@ -516,7 +517,8 @@ Options ParseOptions(int argc, char **argv) {
   desc.AddOption("short_prefix", "s", opt.short_prefix, "prefix of shorter k binary edge files");
   desc.AddOption("long_prefix", "l", opt.long_prefix, "prefix of longer/current k binary edge files");
   desc.AddOption("output_prefix", "o", opt.output_prefix, "output prefix for edge files");
-  desc.AddOption("contig", "c", opt.contig_file, "contigs used by merge mode");
+  desc.AddOption("contig", "c", opt.contig_file, "short/pruned contigs used by merge mode overlap extension");
+  desc.AddOption("long_contig", "C", opt.long_contig_file, "long/pruned contigs scanned directly for long-k edges in merge mode");
   desc.AddOption("short_k", "k", opt.short_k, "shorter k-mer size");
   desc.AddOption("long_k", "K", opt.long_k, "longer/current k-mer size");
   desc.AddOption("num_cpu_threads", "t", opt.num_threads, "number of CPU threads/output files");
@@ -807,6 +809,11 @@ int RunMerge(const Options &opt) {
   uint64_t extended_windows_seen = 0;
   uint64_t extended_edges_added = 0;
   uint64_t extended_edges_duplicate = 0;
+  uint64_t long_contig_seen = 0;
+  uint64_t long_contig_orientations = 0;
+  uint64_t long_contig_windows_seen = 0;
+  uint64_t long_contig_edges_added = 0;
+  uint64_t long_contig_edges_duplicate = 0;
   std::ofstream contig_report(opt.output_prefix + ".contig_edges.txt");
   contig_report << "#edge\tmultiplicity\taction\tcontig\tdirection\tlong_edge\textension_offset\tduplicate_source\n";
 
@@ -893,8 +900,25 @@ int RunMerge(const Options &opt) {
       ++contig_seen;
       std::string rev = ReverseString(seq);
       process_contig_orientation(name, rev, "/rev");
-      std::string comp = ComplementString(seq);
-      if (comp != rev) process_contig_orientation(name, comp, "/comp");
+    }
+  }
+
+  if (!opt.long_contig_file.empty()) {
+    std::ifstream long_contigs(opt.long_contig_file);
+    std::string name, seq;
+    while (ReadNextFasta(&long_contigs, &name, &seq)) {
+      ++long_contig_seen;
+      std::string rev = ReverseString(seq);
+      if (rev.size() < edge_len) continue;
+      ++long_contig_orientations;
+      uint64_t before_seen = extended_windows_seen;
+      uint64_t before_added = extended_edges_added;
+      uint64_t before_duplicate = extended_edges_duplicate;
+      emit_extended_windows(rev, name + "/rev", "long_contig_window", ".",
+                            0, rev.size() - edge_len + 1);
+      long_contig_windows_seen += extended_windows_seen - before_seen;
+      long_contig_edges_added += extended_edges_added - before_added;
+      long_contig_edges_duplicate += extended_edges_duplicate - before_duplicate;
     }
   }
   writer.Finalize();
@@ -931,7 +955,13 @@ int RunMerge(const Options &opt) {
   summary << "index_build_threads\t" << index_threads << '\n';
   summary << "contigs_seen\t" << contig_seen << '\n';
   summary << "contig_orientations_scanned\t" << contig_orientations << '\n';
-  summary << "contig_orientation_modes\trev,comp\n";
+  summary << "contig_orientation_modes\trev\n";
+  summary << "long_contigs_seen\t" << long_contig_seen << '\n';
+  summary << "long_contig_orientations_scanned\t" << long_contig_orientations << '\n';
+  summary << "long_contig_orientation_modes\trev\n";
+  summary << "long_contig_windows_seen\t" << long_contig_windows_seen << '\n';
+  summary << "long_contig_edges_added\t" << long_contig_edges_added << '\n';
+  summary << "long_contig_edges_duplicate\t" << long_contig_edges_duplicate << '\n';
   summary << "overlap_matches\t" << overlap_matches << '\n';
   summary << "extended_windows_seen\t" << extended_windows_seen << '\n';
   summary << "extended_edges_added\t" << extended_edges_added << '\n';
