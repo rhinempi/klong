@@ -139,6 +139,31 @@ int CompareForwardAndReverseComplement(const uint32_t *edge, unsigned offset,
   return 0;
 }
 
+int CompareStringForwardAndReverseComplement(const std::string &seq,
+                                             unsigned offset, unsigned len) {
+  for (unsigned i = 0; i < len; ++i) {
+    uint8_t f;
+    uint8_t r_source;
+    switch (seq[offset + i]) {
+      case 'A': case 'a': f = 0; break;
+      case 'C': case 'c': f = 1; break;
+      case 'G': case 'g': f = 2; break;
+      case 'T': case 't': f = 3; break;
+      default: return 0;
+    }
+    switch (seq[offset + len - 1 - i]) {
+      case 'A': case 'a': r_source = 0; break;
+      case 'C': case 'c': r_source = 1; break;
+      case 'G': case 'g': r_source = 2; break;
+      case 'T': case 't': r_source = 3; break;
+      default: return 0;
+    }
+    uint8_t r = 3 - r_source;
+    if (f != r) return f < r ? -1 : 1;
+  }
+  return 0;
+}
+
 KmerKey CanonicalKeyFromEdge(const uint32_t *edge, unsigned offset,
                              unsigned len) {
   KmerKey key;
@@ -190,6 +215,7 @@ bool RawKeyFromString(const std::string &seq, unsigned offset, unsigned len,
 bool CanonicalKeyFromString(const std::string &seq, unsigned offset,
                             unsigned len, KmerKey *out) {
   KmerKey fwd, rev;
+  bool use_forward = CompareStringForwardAndReverseComplement(seq, offset, len) <= 0;
   for (unsigned i = 0; i < len; ++i) {
     uint8_t b;
     switch (seq[offset + i]) {
@@ -202,7 +228,7 @@ bool CanonicalKeyFromString(const std::string &seq, unsigned offset,
     SetPackedBase(&fwd, i, b);
     SetPackedBase(&rev, len - 1 - i, 3 - b);
   }
-  *out = std::memcmp(fwd.words, rev.words, sizeof(fwd.words)) <= 0 ? fwd : rev;
+  *out = use_forward ? fwd : rev;
   return true;
 }
 
@@ -457,9 +483,14 @@ uint64_t SelectBloomByteCap(const Options &opt) {
 }
 
 bool ReadNextFasta(std::ifstream *in, std::string *name, std::string *seq) {
+  static std::string pending_name;
   seq->clear();
   std::string line;
-  if (name->empty()) {
+  if (!pending_name.empty()) {
+    *name = pending_name;
+    pending_name.clear();
+  } else {
+    name->clear();
     while (std::getline(*in, line)) {
       if (!line.empty() && line[0] == '>') {
         *name = line.substr(1);
@@ -470,12 +501,11 @@ bool ReadNextFasta(std::ifstream *in, std::string *name, std::string *seq) {
   if (name->empty()) return false;
   while (std::getline(*in, line)) {
     if (!line.empty() && line[0] == '>') {
-      *name = line.substr(1);
+      pending_name = line.substr(1);
       return true;
     }
     seq->append(line);
   }
-  name->clear();
   return !seq->empty();
 }
 
@@ -679,7 +709,21 @@ int RunMerge(const Options &opt) {
 
   EdgeOutputWriter writer(opt.output_prefix, opt.long_k, base_meta.words_per_edge,
                           opt.num_threads);
-  std::unordered_set<KmerKey, KmerKeyHash> emitted;
+  uint64_t bloom_byte_cap = SelectBloomByteCap(opt);
+  uint64_t merge_bloom_bytes = std::max<uint64_t>(2ULL << 20, bloom_byte_cap / 2);
+  uint64_t expected_merge_items = std::max<uint64_t>(1, TotalRecords(base_meta));
+  uint64_t read_count_target_bytes = std::max<uint64_t>(1ULL << 20, expected_merge_items * 64ULL);
+  uint64_t extension_target_bytes = std::max<uint64_t>(1ULL << 20, expected_merge_items * 64ULL);
+  uint64_t read_count_bloom_bytes = std::min(merge_bloom_bytes, read_count_target_bytes);
+  uint64_t extension_bloom_bytes = std::min(merge_bloom_bytes, extension_target_bytes);
+  BloomFilter read_count_edges(read_count_bloom_bytes * 8,
+                               ChooseHashCount(read_count_bloom_bytes * 8,
+                                               expected_merge_items,
+                                               opt.max_hashes));
+  BloomFilter emitted_extensions(extension_bloom_bytes * 8,
+                                 ChooseHashCount(extension_bloom_bytes * 8,
+                                                 expected_merge_items,
+                                                 opt.max_hashes));
   std::vector<std::string> long_oriented_edges;
   long_oriented_edges.reserve(static_cast<size_t>(TotalRecords(base_meta)) * 2);
 
@@ -695,10 +739,8 @@ int RunMerge(const Options &opt) {
     ForEachEdgeInFile(opt.long_prefix, base_meta, file_id, [&](const uint32_t *edge) {
       ++base_seen;
       KmerKey key = CanonicalKeyFromEdge(edge, 0, edge_len);
-      if (!emitted.insert(key).second) {
-        ++base_duplicate;
-        return;
-      }
+      if (read_count_edges.Contains(key)) ++base_duplicate;
+      read_count_edges.Add(key);
       writer.Write(edge, file_id, "read_count_base");
       ++base_added;
 
@@ -766,22 +808,38 @@ int RunMerge(const Options &opt) {
   uint64_t extended_edges_added = 0;
   uint64_t extended_edges_duplicate = 0;
   std::ofstream contig_report(opt.output_prefix + ".contig_edges.txt");
-  contig_report << "#edge\tmultiplicity\taction\tcontig\tdirection\tlong_edge\n";
+  contig_report << "#edge\tmultiplicity\taction\tcontig\tdirection\tlong_edge\textension_offset\tduplicate_source\n";
 
   auto emit_extended_windows = [&](const std::string &extended,
                                    const std::string &contig_name,
                                    const char *direction,
-                                   const std::string &long_edge) {
+                                   const std::string &long_edge,
+                                   size_t first_window,
+                                   size_t last_window) {
     if (extended.size() < edge_len) return;
     std::vector<uint32_t> packed;
-    for (size_t i = 0; i + edge_len <= extended.size(); ++i) {
+    last_window = std::min(last_window, extended.size() - edge_len + 1);
+    for (size_t i = first_window; i < last_window; ++i) {
+      size_t extension_offset = i - first_window + 1;
       KmerKey key;
       if (!CanonicalKeyFromString(extended, static_cast<unsigned>(i), edge_len, &key)) continue;
       ++extended_windows_seen;
-      if (!emitted.insert(key).second) {
+      const char *duplicate_source = nullptr;
+      if (read_count_edges.Contains(key)) {
+        duplicate_source = "read_count_base_bloom";
+      } else if (emitted_extensions.Contains(key)) {
+        duplicate_source = "contig_overlap_extension_bloom";
+      }
+      if (duplicate_source != nullptr) {
         ++extended_edges_duplicate;
+        contig_report << BasesFromKey(key, edge_len) << '\t'
+                      << kContigEdgeMultiplicity << "\tduplicate\t"
+                      << contig_name << '\t' << direction << '\t'
+                      << long_edge << '\t' << extension_offset << '\t'
+                      << duplicate_source << '\n';
         continue;
       }
+      emitted_extensions.Add(key);
       PackKeyAsEdge(key, edge_len, base_meta.words_per_edge,
                     kContigEdgeMultiplicity, &packed);
       writer.Write(packed.data(), extended_edges_added % opt.num_threads,
@@ -790,7 +848,7 @@ int RunMerge(const Options &opt) {
       contig_report << BasesFromKey(key, edge_len) << '\t'
                     << kContigEdgeMultiplicity << "\tadded\t"
                     << contig_name << '\t' << direction << '\t'
-                    << long_edge << '\n';
+                    << long_edge << '\t' << extension_offset << "\t.\n";
     }
   };
 
@@ -810,8 +868,10 @@ int RunMerge(const Options &opt) {
       const std::string &long_edge = long_oriented_edges[it->id];
       ++overlap_matches;
       std::string extended = long_edge + seq.substr(overlap_len);
+      size_t extra_len = seq.size() - overlap_len;
       emit_extended_windows(extended, name + orientation,
-                            "contig_prefix_to_long_suffix", long_edge);
+                            "contig_prefix_to_long_suffix", long_edge,
+                            1, extra_len + 1);
     }
 
     auto prefix_hits = equal_range_for(prefix_entries, contig_suffix);
@@ -819,8 +879,10 @@ int RunMerge(const Options &opt) {
       const std::string &long_edge = long_oriented_edges[it->id];
       ++overlap_matches;
       std::string extended = seq.substr(0, seq.size() - overlap_len) + long_edge;
+      size_t extra_len = seq.size() - overlap_len;
       emit_extended_windows(extended, name + orientation,
-                            "contig_suffix_to_long_prefix", long_edge);
+                            "contig_suffix_to_long_prefix", long_edge,
+                            0, extra_len);
     }
   };
 
@@ -846,7 +908,21 @@ int RunMerge(const Options &opt) {
   summary << "output_edge_prefix\t" << opt.output_prefix << '\n';
   summary << "base_edges_seen\t" << base_seen << '\n';
   summary << "base_edges_added\t" << base_added << '\n';
-  summary << "base_edges_duplicate\t" << base_duplicate << '\n';
+  summary << "base_edges_bloom_hits\t" << base_duplicate << '\n';
+  summary << "merge_read_count_bloom_bits\t" << read_count_edges.num_bits() << '\n';
+  summary << "merge_read_count_bloom_bytes\t" << read_count_edges.num_bytes() << '\n';
+  summary << "merge_read_count_bloom_hashes\t" << read_count_edges.num_hashes() << '\n';
+  summary << "merge_read_count_bloom_estimated_fpr\t"
+          << std::setprecision(12)
+          << EstimateFpr(read_count_edges.num_bits(), expected_merge_items,
+                         read_count_edges.num_hashes()) << '\n';
+  summary << "merge_extension_bloom_bits\t" << emitted_extensions.num_bits() << '\n';
+  summary << "merge_extension_bloom_bytes\t" << emitted_extensions.num_bytes() << '\n';
+  summary << "merge_extension_bloom_hashes\t" << emitted_extensions.num_hashes() << '\n';
+  summary << "merge_extension_bloom_estimated_fpr\t"
+          << std::setprecision(12)
+          << EstimateFpr(emitted_extensions.num_bits(), expected_merge_items,
+                         emitted_extensions.num_hashes()) << '\n';
   summary << "long_oriented_edges_indexed\t" << long_oriented_edges.size() << '\n';
   summary << "long_prefix_index_entries\t" << prefix_entries.size() << '\n';
   summary << "long_suffix_index_entries\t" << suffix_entries.size() << '\n';
@@ -861,8 +937,8 @@ int RunMerge(const Options &opt) {
   summary << "extended_edges_added\t" << extended_edges_added << '\n';
   summary << "extended_edges_duplicate\t" << extended_edges_duplicate << '\n';
   summary << "contig_edge_multiplicity\t" << kContigEdgeMultiplicity << '\n';
-  summary << "output_edges_total\t" << emitted.size() << '\n';
-  summary << "representation\tbinary_edges_read_count_plus_exact_k_overlap_extensions\n";
+  summary << "output_edges_total\t" << base_added + extended_edges_added << '\n';
+  summary << "representation\tbinary_edges_read_count_plus_exact_k_overlap_extensions_bloom_redundancy_filter\n";
   return 0;
 }
 
