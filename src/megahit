@@ -25,6 +25,7 @@ import json
 import logging
 import multiprocessing
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -34,6 +35,7 @@ import time
 import math
 
 logger = logging.getLogger(__name__)
+REDUCTION_MAX_K = 60
 
 _usage_message = '''
 contact: Dinghua Li <voutcn@gmail.com>
@@ -93,6 +95,7 @@ Optional Arguments:
     --out-prefix             <string>       output prefix (the contig file will be OUT_DIR/OUT_PREFIX.contigs.fa)
     --min-contig-len         <int>          minimum length of contigs to output [200]
     --keep-tmp-files                        keep all temporary files
+    --no-human-readable-output              disable extra text edge/debug reports in tmp directories
     --tmp-dir                <string>       set temp directory
 
 Other Arguments:
@@ -190,6 +193,7 @@ class Options:
         self.out_prefix = ''
         self.kmin_1pass = False
         self.debug_assembly = False
+        self.human_readable_output = True
         self.pe1 = []
         self.pe2 = []
         self.pe12 = []
@@ -302,6 +306,7 @@ def parse_option(argv):
                                     'num-cpu-threads=',
                                     'kmin-1pass',
                                     'debug-assembly',
+                                    'no-human-readable-output',
                                     'k-min=',
                                     'k-max=',
                                     'k-step=',
@@ -356,6 +361,8 @@ def parse_option(argv):
             opt.kmin_1pass = True
         elif option == '--debug-assembly':
             opt.debug_assembly = True
+        elif option == '--no-human-readable-output':
+            opt.human_readable_output = False
         elif option == '--k-min':
             opt.k_min = int(value)
             opt.set_list_by_min_max_step = True
@@ -974,6 +981,7 @@ def reduce_edges_for_k(short_k, long_k):
                   '--short_k', str(short_k),
                   '--long_k', str(long_k),
                   '--num_cpu_threads', str(opt.num_cpu_threads),
+                  '--human_readable', '1' if opt.human_readable_output else '0',
                   '--max_bloom_gb', '60',
                   '--reserve_gb', '1']
     run_sub_command([opt.megahit_core, 'prefixbf'] + reduce_opt,
@@ -1007,7 +1015,8 @@ def merge_contig_edges_into_next_k(short_k, long_k):
                  '--contig', merge_contigs,
                  '--short_k', str(short_k),
                  '--long_k', str(long_k),
-                 '--num_cpu_threads', str(opt.num_cpu_threads)]
+                 '--num_cpu_threads', str(opt.num_cpu_threads),
+                 '--human_readable', '1' if opt.human_readable_output else '0']
     if merge_long_contigs is not None:
         merge_opt += ['--long_contig', merge_long_contigs]
     run_sub_command([opt.megahit_core, 'prefixbf'] + merge_opt,
@@ -1031,7 +1040,7 @@ def build_graph_from_edge_prefix(kmer_k, input_prefix=None):
     return output_prefix
 
 
-def build_first_graph():
+def build_first_graph(use_reduction_edges):
     common_option = ['-k', str(opt.k_min),
                      '-m', str(opt.min_count),
                      '--host_mem', str(opt.host_mem),
@@ -1040,9 +1049,14 @@ def build_first_graph():
                      '--num_cpu_threads', str(opt.num_cpu_threads),
                      '--read_lib_file', opt.read_lib_path]
 
-    if opt.kmin_1pass:
+    if opt.kmin_1pass and use_reduction_edges:
         logger.warning('Reduced-edge iteration ignores --kmin-1pass and counts k-min edges first')
+    if opt.kmin_1pass and not use_reduction_edges:
+        build_first_graph_1pass(common_option)
+        return True
+
     count_mink(common_option)
+    return False
 
 
 @check_point
@@ -1157,6 +1171,9 @@ def assemble(cur_k, graph_input_prefix=None, next_k=None):
 
     if cur_k == opt.k_max:
         assembly_cmd.append('--is_final_round')
+        if opt.human_readable_output:
+            assembly_cmd += ['--pruned_unitig',
+                             contig_prefix(cur_k) + '.pruned_unitigs.fa']
 
     if opt.no_local:
         assembly_cmd.append('--output_standalone')
@@ -1188,10 +1205,19 @@ def merge_final(final_k):
     if opt.out_prefix != '':
         final_contig_name = os.path.join(opt.out_dir, opt.out_prefix + '.contigs.fa')
 
+    rejected_contig_name = None
+    if opt.human_readable_output:
+        rejected_contig_name = os.path.splitext(final_contig_name)[0] + \
+                               '.below_%d.fa' % opt.min_contig_len
+
     with open(final_contig_name, 'w') as final_contigs:
+        filter_cmd = shlex.quote(opt.megahit_core) + ' filterbylen ' + \
+                     str(opt.min_contig_len)
+        if rejected_contig_name is not None:
+            filter_cmd += ' ' + shlex.quote(rejected_contig_name)
         merge_cmd = 'cat ' + opt.contig_dir + '/*.final.contigs.fa ' + \
-                    contig_prefix(final_k) + '.contigs.fa | ' + \
-                    opt.megahit_core + ' filterbylen ' + str(opt.min_contig_len)
+                    shlex.quote(contig_prefix(final_k) + '.contigs.fa') + \
+                    ' | ' + filter_cmd
         p = subprocess.Popen(merge_cmd, shell=True, stdout=final_contigs, stderr=subprocess.PIPE)
         _, log = p.communicate()
         logger.info(log.rstrip().decode('utf-8'))
@@ -1209,7 +1235,9 @@ def run_sub_command(cmd, msg, verbose=False):
     logger.info(msg)
     logger.debug('command %s' % ' '.join(cmd))
 
-    p = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+    env = os.environ.copy()
+    env['MEGAHIT_HUMAN_READABLE_OUTPUT'] = '1' if opt.human_readable_output else '0'
+    p = subprocess.Popen(cmd, stderr=subprocess.PIPE, env=env)
 
     try:
         while True:
@@ -1260,21 +1288,62 @@ def main(argv=None):
         logger.info('k list: %s ' % ','.join(map(str, opt.k_list)))
         logger.info('Memory used: %d' % opt.host_mem)
 
-        build_first_graph()
-
         try:
-            for next_k_idx in range(1, len(opt.k_list)):
-                cur_k = opt.k_list[next_k_idx - 1]
-                next_k = opt.k_list[next_k_idx]
+            reduction_k_list = [k for k in opt.k_list if k <= REDUCTION_MAX_K]
+            flanking_k_list = [k for k in opt.k_list if k > REDUCTION_MAX_K]
+            first_graph_built = build_first_graph(bool(reduction_k_list))
 
+            if reduction_k_list:
+                logger.info('Using reduction/merge workflow through k = %d',
+                            reduction_k_list[-1])
+            else:
+                logger.info('No requested k <= %d; using the original flanking workflow',
+                            REDUCTION_MAX_K)
+
+            for next_k_idx in range(1, len(reduction_k_list)):
+                cur_k = reduction_k_list[next_k_idx - 1]
+                next_k = reduction_k_list[next_k_idx]
                 count_and_build_read_graph(next_k)
                 reduced_prefix = reduce_edges_for_k(cur_k, next_k)
                 graph_input = build_graph_from_edge_prefix(cur_k, reduced_prefix)
                 assemble(cur_k, graph_input, next_k)
                 merge_contig_edges_into_next_k(cur_k, next_k)
 
-            graph_input = build_graph_from_edge_prefix(opt.k_max, current_edge_prefix(opt.k_max))
-            assemble(opt.k_max, graph_input)
+            if reduction_k_list:
+                cur_k = reduction_k_list[-1]
+                if cur_k == opt.k_min and len(reduction_k_list) == 1:
+                    # No reduction preceded the handoff, so retain the normal
+                    # first-k graph build (including mercy k-mers when enabled).
+                    build_graph(cur_k, 0)
+                    assemble(cur_k, graph_prefix(cur_k))
+                else:
+                    graph_input = build_graph_from_edge_prefix(
+                        cur_k, current_edge_prefix(cur_k))
+                    # A normal cleaned assembly at the handoff k emits the
+                    # contig, bubble, and additional-contig inputs required by
+                    # the original flanking iteration.
+                    assemble(cur_k, graph_input)
+            else:
+                cur_k = opt.k_min
+                if not first_graph_built:
+                    build_graph(cur_k, 0)
+                assemble(cur_k, graph_prefix(cur_k))
+
+            if flanking_k_list:
+                logger.info('Switching to original flanking workflow after k = %d',
+                            cur_k)
+
+            for next_k in flanking_k_list:
+                if next_k <= cur_k:
+                    continue
+                if not opt.no_local:
+                    local_assemble(cur_k, next_k)
+
+                iterate(cur_k, next_k - cur_k)
+                build_graph(next_k, cur_k)
+                assemble(next_k, graph_prefix(next_k))
+                cur_k = next_k
+
             merge_final(opt.k_max)
 
         except EarlyTerminate as et:
