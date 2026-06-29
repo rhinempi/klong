@@ -824,7 +824,8 @@ def create_library_file():
 
 @check_point
 def build_library():
-    cmd = [opt.megahit_core, 'buildlib', opt.read_lib_path, opt.read_lib_path]
+    cmd = [opt.megahit_core, 'buildlib', opt.read_lib_path, opt.read_lib_path,
+           str(opt.num_cpu_threads)]
     fifos = list()
     pipes = list()
 
