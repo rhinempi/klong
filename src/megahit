@@ -20,7 +20,10 @@
 
 
 
+import bz2
+import filecmp
 import getopt
+import gzip
 import json
 import logging
 import multiprocessing
@@ -49,6 +52,14 @@ Usage:
     --12                     <pe12>         comma-separated list of interleaved fasta/q paired-end files
     -r/--read                <se>           comma-separated list of fasta/q single-end files
 
+  Optional paired-end merging (FASTQ only):
+    --merge-pairs                           export merged pairs to OUT_DIR/tmp/flash/*.merged.fa.gz
+                                            and build consensus local contigs at each flanking transition
+    --flash-min-overlap      <int>          minimum overlap [10]
+    --flash-max-overlap      <int>          overlap length used for mismatch scoring [65]
+    --flash-max-mismatch-density <float>    maximum overlap mismatch density [0.25]
+    --flash-phred-offset     <int>          FASTQ quality offset, 33 or 64 [33]
+
 Optional Arguments:
   Basic assembly options:
     --min-count              <int>          minimum multiplicity for filtering (k_min+1)-mers [2]
@@ -73,7 +84,7 @@ Optional Arguments:
                                             the average depth of the neighborhoods [0.2]
     --max-tip-len            <int>          remove tips less than this value [2*k]
     --cleaning-rounds        <int>          number of rounds for graph cleanning [5]
-    --no-local                              disable local assembly
+    --no-local                              disable consensus local contigs in subsequent graphs
     --kmin-1pass                            use 1pass mode to build SdBG of k_min
 
   Presets parameters:
@@ -194,6 +205,11 @@ class Options:
         self.kmin_1pass = False
         self.debug_assembly = False
         self.human_readable_output = True
+        self.merge_pairs = False
+        self.flash_min_overlap = 10
+        self.flash_max_overlap = 65
+        self.flash_max_mismatch_density = 0.25
+        self.flash_phred_offset = 33
         self.pe1 = []
         self.pe2 = []
         self.pe12 = []
@@ -299,6 +315,11 @@ def parse_option(argv):
         opts, args = getopt.getopt(argv, 'hm:o:r:t:v1:2:l:f',
                                    ['help',
                                     'read=',
+                                    'merge-pairs',
+                                    'flash-min-overlap=',
+                                    'flash-max-overlap=',
+                                    'flash-max-mismatch-density=',
+                                    'flash-phred-offset=',
                                     '12=',
                                     'memory=',
                                     'out-dir=',
@@ -359,6 +380,16 @@ def parse_option(argv):
             opt.num_cpu_threads = int(value)
         elif option == '--kmin-1pass':
             opt.kmin_1pass = True
+        elif option == '--merge-pairs':
+            opt.merge_pairs = True
+        elif option == '--flash-min-overlap':
+            opt.flash_min_overlap = int(value)
+        elif option == '--flash-max-overlap':
+            opt.flash_max_overlap = int(value)
+        elif option == '--flash-max-mismatch-density':
+            opt.flash_max_mismatch_density = float(value)
+        elif option == '--flash-phred-offset':
+            opt.flash_phred_offset = int(value)
         elif option == '--debug-assembly':
             opt.debug_assembly = True
         elif option == '--no-human-readable-output':
@@ -495,6 +526,13 @@ def setup_logger():
 
 
 def check_and_correct_option():
+    if opt.flash_min_overlap < 1 or opt.flash_max_overlap < opt.flash_min_overlap:
+        raise Usage('FLASH overlaps must satisfy 1 <= min-overlap <= max-overlap.')
+    if not 0 <= opt.flash_max_mismatch_density <= 1:
+        raise Usage('--flash-max-mismatch-density must be in [0, 1].')
+    if opt.flash_phred_offset not in (33, 64):
+        raise Usage('--flash-phred-offset must be 33 or 64.')
+
     # set mode
     if opt.memory < 0:
         raise Usage('-m cannot be less than 0!')
@@ -698,6 +736,60 @@ def contig_prefix(kmer_k):
     return os.path.join(opt.contig_dir, 'k' + str(kmer_k))
 
 
+def contig_ends_path(cur_k):
+    return os.path.join(opt.out_dir, 'tmp', 'k' + str(cur_k), 'k{}.contig_ends.fa'.format(cur_k))
+
+
+def extract_contig_ends(cur_k, flank_length=290):
+    if flank_length <= 0:
+        raise Usage('Contig-end length must be positive.')
+    source_path = contig_prefix(cur_k) + '.contigs.fa'
+    if not os.path.isfile(source_path):
+        raise Usage('Cannot extract contig ends: missing contigs ' + source_path)
+    output_path = contig_ends_path(cur_k)
+    output_dir = os.path.dirname(output_path)
+    os.makedirs(output_dir, exist_ok=True)
+    whole_count, split_count = 0, 0
+
+    def write_record(dest, header, sequence):
+        nonlocal whole_count, split_count
+        if len(sequence) < 2 * flank_length:
+            dest.write(header + '\n' + sequence + '\n')
+            whole_count += 1
+            return
+        name = header[1:].split()[0]
+        length = len(sequence)
+        dest.write('>{}|start source_length={} region=1-{}\n{}\n'.format(
+            name, length, flank_length, sequence[:flank_length]))
+        dest.write('>{}|end source_length={} region={}-{}\n{}\n'.format(
+            name, length, length - flank_length + 1, length, sequence[-flank_length:]))
+        split_count += 1
+
+    try:
+        with open(source_path) as source, open(output_path + '.tmp', 'w') as dest:
+            header, chunks = None, []
+            for line in source:
+                if line.startswith('>'):
+                    if header is not None:
+                        write_record(dest, header, ''.join(chunks))
+                    header, chunks = line.rstrip('\r\n'), []
+                    if not header[1:].strip():
+                        raise Usage('Empty FASTA contig name in ' + source_path)
+                elif line.strip():
+                    if header is None:
+                        raise Usage('FASTA sequence without a header in ' + source_path)
+                    chunks.append(line.strip())
+            if header is not None:
+                write_record(dest, header, ''.join(chunks))
+        if not os.path.isfile(output_path) or not filecmp.cmp(output_path + '.tmp', output_path, shallow=False):
+            os.replace(output_path + '.tmp', output_path)
+    finally:
+        remove_if_exists(output_path + '.tmp')
+    logger.info('Contig ends from k = %d: %d whole contigs, %d split contigs; output %s',
+                cur_k, whole_count, split_count, output_path)
+    return output_path
+
+
 def pruned_short_contig_file(kmer_k, next_k):
     return contig_prefix(kmer_k) + '.lt_k%d_plus1.contigs.fa' % next_k
 
@@ -778,6 +870,220 @@ def remove_temp_after_assemble(kmer_k):
         remove_if_exists(graph_prefix(kmer_k) + '.' + extension)
     for i in range(opt.num_cpu_threads):
         remove_if_exists(graph_prefix(kmer_k) + '.sdbg.' + str(i))
+
+
+def merge_paired_reads():
+    if not opt.merge_pairs or not (opt.pe1 or opt.pe12):
+        return
+
+    output_tmp = os.path.join(opt.out_dir, 'tmp')
+    mkdir_if_not_exists(output_tmp)
+    flash_dir = os.path.join(output_tmp, 'flash')
+    mkdir_if_not_exists(flash_dir)
+    manifest = os.path.join(flash_dir, 'merged.json')
+    if check_point._logged_checkpoint is not None and os.path.exists(manifest):
+        with open(manifest) as f:
+            outputs = json.load(f)
+        if all(os.path.isfile(path) for path in outputs):
+            logger.info('Reuse merged FASTA output in %s', flash_dir)
+            return
+
+    # Independent completion marker, leaving assembly checkpoint numbering intact.
+    remove_if_exists(manifest)
+    outputs = []
+    inputs = [(False, pair) for pair in zip(opt.pe1, opt.pe2)]
+    inputs += [(True, (path,)) for path in opt.pe12]
+    for i, (interleaved, paths) in enumerate(inputs):
+        with tempfile.TemporaryDirectory(dir=opt.temp_dir, prefix='flash-') as work_dir:
+            input_paths = []
+            for j, path in enumerate(paths):
+                if path.endswith('.bz2'):
+                    unpacked = os.path.join(work_dir, 'input.{}.fastq'.format(j))
+                    with bz2.open(path, 'rb') as source, open(unpacked, 'wb') as dest:
+                        shutil.copyfileobj(source, dest)
+                    input_paths.append(unpacked)
+                else:
+                    input_paths.append(path)
+            prefix = 'library.{}'.format(i)
+            cmd = [opt.megahit_core, 'flash', '-t', str(opt.num_cpu_threads),
+                   '-m', str(opt.flash_min_overlap), '-M', str(opt.flash_max_overlap),
+                   '-x', str(opt.flash_max_mismatch_density),
+                   '-p', str(opt.flash_phred_offset), '-d', work_dir, '-o', prefix]
+            if interleaved:
+                cmd.append('--interleaved-input')
+            cmd += input_paths
+            run_sub_command(cmd, 'Merge paired-end library {} with FLASH'.format(i), verbose=True)
+            output = os.path.join(flash_dir, prefix + '.merged.fa.gz')
+            try:
+                fastq_to_fasta_gz(os.path.join(work_dir, prefix + '.extendedFrags.fastq'),
+                                  output + '.tmp')
+                os.replace(output + '.tmp', output)
+            finally:
+                remove_if_exists(output + '.tmp')
+            outputs.append(output)
+            logger.info('Merged FASTA: %s', output)
+    with open(manifest + '.tmp', 'w') as f:
+        json.dump(outputs, f)
+    os.replace(manifest + '.tmp', manifest)
+
+
+def fastq_to_fasta_gz(source_path, output_path):
+    # FLASH emits normalized four-line FASTQ records, even for multiline inputs.
+    with open(source_path, 'rb') as source, gzip.open(output_path, 'wb') as dest:
+        while True:
+            header = source.readline()
+            if not header:
+                break
+            sequence = source.readline().rstrip(b'\r\n')
+            separator = source.readline()
+            quality = source.readline().rstrip(b'\r\n')
+            if not header.startswith(b'@') or not separator.startswith(b'+') or len(sequence) != len(quality):
+                raise Usage('Invalid merged FASTQ output from FLASH: ' + source_path)
+            dest.write(b'>' + header[1:].rstrip(b'\r\n') + b'\n' + sequence + b'\n')
+
+
+def file_signature(path):
+    if not os.path.isfile(path):
+        raise Usage('Missing input file: ' + path)
+    info = os.stat(path)
+    return {'path': os.path.abspath(path), 'size': info.st_size, 'mtime_ns': info.st_mtime_ns}
+
+
+def map_merged_reads(cur_k):
+    if not opt.merge_pairs:
+        return
+    merged_manifest = os.path.join(opt.out_dir, 'tmp', 'flash', 'merged.json')
+    if not os.path.isfile(merged_manifest):
+        logger.info('No merged-read libraries to map at k = %d', cur_k)
+        return
+    with open(merged_manifest) as source:
+        queries = json.load(source)
+    if not queries:
+        return
+    reference = contig_ends_path(cur_k)
+    if not os.path.isfile(reference):
+        raise Usage('Cannot map merged reads: missing contig ends ' + reference)
+    if os.path.getsize(reference) == 0:
+        logger.warning('Skip merged-read mapping: no contig ends at k = %d', cur_k)
+        return
+
+    output_dir = os.path.join(opt.out_dir, 'tmp', 'k' + str(cur_k), 'flank_mapping')
+    os.makedirs(output_dir, exist_ok=True)
+    manifest = os.path.join(output_dir, 'mapping.json')
+    parameters = ['-x', 'sr', '-a', '-Y', '-t', str(opt.num_cpu_threads), '-I', '55G']
+
+    configuration = {'version': check_output([opt.megahit_core, 'minimap2', '--version']),
+                     'parameters': parameters, 'reference': file_signature(reference),
+                     'queries': [file_signature(path) for path in queries]}
+    outputs = [os.path.join(output_dir, 'library.{}.sam'.format(i)) for i in range(len(queries))]
+    if check_point._logged_checkpoint is not None and os.path.isfile(manifest):
+        with open(manifest) as source:
+            completed = json.load(source)
+        if (completed.get('configuration') == configuration and completed.get('outputs') == outputs
+                and all(os.path.isfile(path) and os.path.getsize(path) > 0 for path in outputs)):
+            logger.info('Reuse merged-read alignments at k = %d', cur_k)
+            return
+
+    # This stage has its own completion marker to preserve assembly checkpoints.
+    remove_if_exists(manifest)
+    for query, output in zip(queries, outputs):
+        cmd = [opt.megahit_core, 'minimap2'] + parameters + ['-o', output + '.tmp', reference, query]
+        try:
+            run_sub_command(cmd, 'Map merged reads to k = %d contig ends: %s' % (cur_k, query), verbose=True)
+            os.replace(output + '.tmp', output)
+        finally:
+            remove_if_exists(output + '.tmp')
+    with open(manifest + '.tmp', 'w') as dest:
+        json.dump({'configuration': configuration, 'outputs': outputs}, dest, indent=2)
+    os.replace(manifest + '.tmp', manifest)
+
+
+def extend_contig_ends(cur_k):
+    if not opt.merge_pairs:
+        return
+    reference = contig_ends_path(cur_k)
+    output_dir = os.path.join(opt.out_dir, 'tmp', 'k' + str(cur_k), 'flank_mapping')
+    mapping_manifest = os.path.join(output_dir, 'mapping.json')
+    if not os.path.isfile(mapping_manifest) or not os.path.isfile(reference) or os.path.getsize(reference) == 0:
+        return
+    with open(mapping_manifest) as source:
+        mapping = json.load(source)
+    if mapping.get('configuration', {}).get('reference') != file_signature(reference):
+        raise Usage('Contig-end mappings are stale; rerun mapping before consensus.')
+    alignments = mapping['outputs']
+    output = os.path.join(os.path.dirname(reference), 'k{}.contig_ends.extended.fa'.format(cur_k))
+    stats = os.path.join(output_dir, 'consensus.tsv')
+    manifest = os.path.join(output_dir, 'consensus.json')
+    configuration = {'algorithm': 'outward-plurality-extended-only-v2', 'reference': file_signature(reference),
+                     'alignments': [file_signature(path) for path in alignments]}
+    if check_point._logged_checkpoint is not None and os.path.isfile(manifest):
+        with open(manifest) as source:
+            completed = json.load(source)
+        valid_output = False
+        if os.path.isfile(output) and os.path.isfile(output + '.info'):
+            try:
+                with open(output + '.info') as source:
+                    count, bases = map(int, source.read().split())
+                valid_output = (count >= 0 and bases >= 0 and (count > 0) == (os.path.getsize(output) > 0)
+                                and (count > 0 or bases == 0))
+            except (OSError, ValueError):
+                pass
+        if (completed == configuration and valid_output and os.path.isfile(stats)
+                and os.path.getsize(stats) > 0):
+            logger.info('Reuse contig-end consensus at k = %d', cur_k)
+            return output
+    remove_if_exists(manifest)
+    cmd = [opt.megahit_core, 'endconsensus', reference, output + '.tmp', stats + '.tmp'] + alignments
+    try:
+        run_sub_command(cmd, 'Build outward contig-end consensus at k = %d' % cur_k, verbose=True)
+        os.replace(output + '.tmp', output)
+        os.replace(output + '.tmp.info', output + '.info')
+        os.replace(stats + '.tmp', stats)
+    finally:
+        remove_if_exists(output + '.tmp')
+        remove_if_exists(output + '.tmp.info')
+        remove_if_exists(stats + '.tmp')
+    with open(manifest + '.tmp', 'w') as dest:
+        json.dump(configuration, dest, indent=2)
+    os.replace(manifest + '.tmp', manifest)
+    return output
+
+
+def remove_temporary_files():
+    if opt.keep_tmp_files or not os.path.exists(opt.temp_dir):
+        return
+    output_tmp = os.path.join(opt.out_dir, 'tmp')
+    if os.path.abspath(opt.temp_dir) == os.path.abspath(output_tmp):
+        def remove_entry(entry):
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.path)
+            else:
+                os.remove(entry.path)
+
+        for entry in os.scandir(opt.temp_dir):
+            if opt.merge_pairs and entry.name == 'flash' and entry.is_dir(follow_symlinks=False):
+                continue
+            if (entry.name.startswith('k') and entry.name[1:].isdigit()
+                    and entry.is_dir(follow_symlinks=False)):
+                children = list(os.scandir(entry.path))
+                keep = {child.name for child in children
+                        if (child.name.endswith(('.contig_ends.fa', '.contig_ends.extended.fa',
+                                                 '.contig_ends.extended.fa.info'))
+                            and child.is_file(follow_symlinks=False))
+                        or (opt.merge_pairs and child.name == 'flank_mapping'
+                            and child.is_dir(follow_symlinks=False))}
+                if not keep:
+                    remove_entry(entry)
+                else:
+                    for child in children:
+                        if child.name not in keep:
+                            remove_entry(child)
+            else:
+                remove_entry(entry)
+        if not os.listdir(opt.temp_dir):
+            os.rmdir(opt.temp_dir)
+    else:
+        shutil.rmtree(opt.temp_dir)
 
 
 def inpipe_cmd(file_name):
@@ -1085,7 +1391,7 @@ def build_graph(kmer_k, kmer_from):
         build_cmd += ['--addi_contig', contig_prefix(kmer_from) + '.addi.fa']
         file_size += os.path.getsize(contig_prefix(kmer_from) + '.addi.fa')
 
-    if os.path.exists(contig_prefix(kmer_from) + '.local.fa'):
+    if not opt.no_local and os.path.exists(contig_prefix(kmer_from) + '.local.fa'):
         build_cmd += ['--local_contig', contig_prefix(kmer_from) + '.local.fa']
         file_size += os.path.getsize(contig_prefix(kmer_from) + '.local.fa')
 
@@ -1190,13 +1496,30 @@ def assemble(cur_k, graph_input_prefix=None, next_k=None):
 
 @check_point
 def local_assemble(cur_k, kmer_to):
-    la_cmd = [opt.megahit_core, 'local',
-              '-c', contig_prefix(cur_k) + '.contigs.fa',
-              '-l', opt.read_lib_path,
-              '-t', str(opt.num_cpu_threads),
-              '-o', contig_prefix(cur_k) + '.local.fa',
-              '--kmax', str(kmer_to)]
-    run_sub_command(la_cmd, 'Local assembly for k = %d' % cur_k)
+    logger.info('Consensus local contigs for k = %d -> %d', cur_k, kmer_to)
+    extended = None
+    if opt.merge_pairs:
+        extract_contig_ends(cur_k)
+        map_merged_reads(cur_k)
+        extended = extend_contig_ends(cur_k)
+    else:
+        logger.warning('Consensus local assembly requires --merge-pairs; writing empty local contigs for k = %d', cur_k)
+    local_file = contig_prefix(cur_k) + '.local.fa'
+    os.makedirs(opt.contig_dir, exist_ok=True)
+    try:
+        if extended is not None:
+            shutil.copyfile(extended, local_file + '.tmp')
+            shutil.copyfile(extended + '.info', local_file + '.info.tmp')
+        else:
+            with open(local_file + '.tmp', 'w'):
+                pass
+            with open(local_file + '.info.tmp', 'w') as dest:
+                dest.write('0 0\n')
+        os.replace(local_file + '.tmp', local_file)
+        os.replace(local_file + '.info.tmp', local_file + '.info')
+    finally:
+        remove_if_exists(local_file + '.tmp')
+        remove_if_exists(local_file + '.info.tmp')
 
 
 @check_point
@@ -1281,6 +1604,7 @@ def main(argv=None):
 
         create_library_file()
         build_library()
+        merge_paired_reads()
 
         if set_max_k_by_lib():
             logger.info('k-max reset to: %d ' % opt.k_max)
@@ -1324,6 +1648,11 @@ def main(argv=None):
                     # contig, bubble, and additional-contig inputs required by
                     # the original flanking iteration.
                     assemble(cur_k, graph_input)
+                if not flanking_k_list or opt.no_local:
+                    if flanking_k_list or opt.merge_pairs:
+                        extract_contig_ends(cur_k)
+                    map_merged_reads(cur_k)
+                    extend_contig_ends(cur_k)
             else:
                 cur_k = opt.k_min
                 if not first_graph_built:
@@ -1350,8 +1679,7 @@ def main(argv=None):
         except EarlyTerminate as et:
             merge_final(et.kmer_size)
 
-        if not opt.keep_tmp_files and os.path.exists(opt.temp_dir):
-            shutil.rmtree(opt.temp_dir)
+        remove_temporary_files()
 
         open(os.path.join(opt.out_dir, 'done'), 'w').close()
 

@@ -30,6 +30,7 @@ LIST(APPEND OTHER_SOURCE
         src/main_iterate.cpp
         src/main_local_assemble.cpp
         src/main_sdbg_build.cpp
+        src/iterate/contig_end_consensus.cpp
         src/utils/options_description.cpp
         )
 
@@ -39,6 +40,24 @@ endif (STATIC_BUILD)
 
 find_package(ZLIB REQUIRED)
 find_package(OpenMP REQUIRED)
+find_package(Threads REQUIRED)
+
+# Keep the upstream C implementation separate from MEGAHIT's C++ sources.
+add_library(flash STATIC
+        src/flash/flash.c
+        src/flash/combine_reads.c
+        src/flash/iostream.c
+        src/flash/read_io.c
+        src/flash/read_queue.c
+        src/flash/read_util.c
+        src/flash/util.c)
+set_target_properties(flash PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
+target_compile_definitions(flash PRIVATE _GNU_SOURCE _FILE_OFFSET_BITS=64)
+target_include_directories(flash PRIVATE ${ZLIB_INCLUDE_DIRS})
+set_source_files_properties(src/flash/flash.c PROPERTIES
+        COMPILE_DEFINITIONS "main=main_flash")
+target_link_libraries(flash PUBLIC ${ZLIB_LIBRARIES} Threads::Threads)
+add_subdirectory(src/minimap2)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DXXH_INLINE_ALL -ftemplate-depth=3000")
@@ -89,7 +108,7 @@ if (STATIC_BUILD)
     set_target_properties(megahit_core PROPERTIES LINK_SEARCH_END_STATIC ON)
 endif (STATIC_BUILD)
 
-target_link_libraries(megahit_core ${ZLIB_LIBRARIES})
+target_link_libraries(megahit_core ${ZLIB_LIBRARIES} flash minimap2)
 
 add_custom_command(
         OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/megahit
@@ -111,6 +130,31 @@ add_custom_target(
 )
 
 add_dependencies(simple_test embedded_megahit)
+
+add_custom_target(flash_test
+        COMMAND ${CMAKE_COMMAND} -E env
+                "MEGAHIT_TEST_CORE=$<TARGET_FILE:megahit_core>"
+                python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_flash.py
+        DEPENDS megahit_core
+        VERBATIM)
+
+add_custom_target(minimap2_test
+        COMMAND ${CMAKE_COMMAND} -E env
+                "MEGAHIT_TEST_CORE=$<TARGET_FILE:megahit_core>"
+                python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_minimap2.py
+        DEPENDS megahit_core
+        VERBATIM)
+
+add_custom_target(contig_ends_test
+        COMMAND python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_contig_ends.py
+        VERBATIM)
+
+add_custom_target(end_consensus_test
+        COMMAND ${CMAKE_COMMAND} -E env
+                "MEGAHIT_TEST_CORE=$<TARGET_FILE:megahit_core>"
+                python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_end_consensus.py
+        DEPENDS megahit_core
+        VERBATIM)
 
 install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/megahit DESTINATION bin)
 install(DIRECTORY test_data DESTINATION share/${PROJECT_NAME})

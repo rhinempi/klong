@@ -31,6 +31,9 @@ int main_assemble(int argc, char **argv);
 int main_local(int argc, char **argv);
 int main_iterate(int argc, char **argv);
 int main_build_lib(int argc, char **argv);
+extern "C" int main_flash(int argc, char **argv);
+extern "C" int main_minimap2(int argc, char **argv);
+int main_contig_end_consensus(int argc, char **argv);
 
 int main_kmer_count(int argc, char **argv);
 int main_read2sdbg(int argc, char **argv);
@@ -50,6 +53,9 @@ void show_help(const char *program_name) {
       "       local          local asssembly\n"
       "       iterate        extract iterative edges\n"
       "       buildlib       build read library\n"
+      "       flash          merge overlapping paired-end FASTQ reads\n"
+      "       minimap2       align reads with bundled Minimap2\n"
+      "       endconsensus   extend contig ends from SAM overhang consensus\n"
       "       count          kmer counting\n"
       "       read2sdbg      build sdbg from reads\n"
       "       seq2sdbg       build sdbg from megahit contigs + edges\n"
@@ -81,6 +87,12 @@ int main(int argc, char **argv) {
     return main_iterate(argc - 1, argv + 1);
   } else if (strcmp(argv[1], "buildlib") == 0) {
     return main_build_lib(argc - 1, argv + 1);
+  } else if (strcmp(argv[1], "flash") == 0) {
+    return main_flash(argc - 1, argv + 1);
+  } else if (strcmp(argv[1], "minimap2") == 0) {
+    return main_minimap2(argc - 1, argv + 1);
+  } else if (strcmp(argv[1], "endconsensus") == 0) {
+    return main_contig_end_consensus(argc - 1, argv + 1);
   } else if (strcmp(argv[1], "count") == 0) {
     return main_kmer_count(argc - 1, argv + 1);
   } else if (strcmp(argv[1], "read2sdbg") == 0) {
