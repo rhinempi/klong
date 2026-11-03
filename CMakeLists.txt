@@ -156,5 +156,19 @@ add_custom_target(end_consensus_test
         DEPENDS megahit_core
         VERBATIM)
 
+add_custom_target(reporting_test
+        COMMAND ${CMAKE_COMMAND} -E env
+                "MEGAHIT_TEST_CORE=$<TARGET_FILE:megahit_core>"
+                python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_reporting.py
+        DEPENDS megahit_core
+        VERBATIM)
+
+add_custom_target(query_merge_test
+        COMMAND ${CMAKE_COMMAND} -E env
+                "MEGAHIT_TEST_CORE=$<TARGET_FILE:megahit_core>"
+                python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_query_merge.py
+        DEPENDS megahit_core
+        VERBATIM)
+
 install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/megahit DESTINATION bin)
 install(DIRECTORY test_data DESTINATION share/${PROJECT_NAME})

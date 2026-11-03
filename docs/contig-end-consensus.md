@@ -1,22 +1,35 @@
 # Contig-End Mapping and Consensus
 
-At every flanking transition (starting at k59 for the default k-list), the
-replacement consensus local stage runs:
+After the reduction/merge pass ends at k59, consensus local contigs from k59
+and the full k59 contigs, bubbles, and additional contigs seed a fresh k21
+SdBG. This seed graph does not reuse first-pass read-count edges. The flanking
+pass then assembles the full configured k-list, by default
+21,29,39,59,79,99,119,141. First-pass files remain unchanged.
+
+At the handoff and every subsequent flanking transition, the consensus stage runs:
 
 1. Extract contig ends to `OUT_DIR/tmp/k59/k59.contig_ends.fa`.
 2. Map merged gzip FASTA libraries to that file with Minimap2.
 3. Build outward consensus extensions in native C++.
 4. Publish extended records as `intermediate_contigs/k59.local.fa` and its info file.
-5. Extract iterative edges, build the k79 SdBG with the new local-contig input,
-   and assemble it. Repeat the same process from k79 to k99 and later phases.
+5. At the handoff, build the k21 seed graph from the k59 sequences. Thereafter,
+   extract iterative edges and build the next SdBG with the new local-contig
+   input, repeating from k21 to k29 through k119 to k141.
+
+The handoff uses the paths shown above. The second pass uses
+`intermediate_contigs/flanking/kN.*` and `tmp/flanking/kN/` to avoid overwriting
+the first pass. Final contigs are merged from the second pass only. Exported
+contig ends, consensus files, and alignments survive normal scratch cleanup
+in both passes.
 
 Mapping and consensus require `--merge-pairs`; without merged reads, the local
 FASTA is empty and its info file is `0 0`. There is no automatic fallback to
 IDBA. `--no-local` disables local-contig publication and graph input entirely.
 The old core `local` subcommand remains available for standalone use but is
-not called by the launcher. The optional reduction-handoff export still runs
-without a subsequent transition when `--merge-pairs` is supplied.
-Custom k-lists and workflows starting above k60 use their actual current k.
+not called by the launcher. Custom k-lists restart at their configured minimum
+after their last reduction k; workflows starting above k60 retain their normal
+increasing-k path without a reduction handoff. Use a fresh output directory
+when switching from the old workflow; old checkpoint numbers are incompatible.
 
 ## Files
 

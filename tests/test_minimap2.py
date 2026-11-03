@@ -176,7 +176,7 @@ class MappingWorkflowOrderTest(unittest.TestCase):
                 'build_graph', 'merge_final', 'remove_temporary_files', 'current_edge_prefix']}
             patches['set_max_k_by_lib'] = mock.Mock(return_value=False)
             patches['build_first_graph'] = mock.Mock(return_value=True)
-            for name in ['assemble', 'map_merged_reads', 'extract_contig_ends', 'iterate']:
+            for name in ['assemble', 'map_merged_reads', 'extract_contig_ends', 'iterate', 'build_flanking_seed']:
                 patches[name] = mock.Mock(side_effect=lambda *args, _name=name: events.append((_name, args)))
             def extend(cur_k):
                 events.append(('extend_contig_ends', (cur_k,)))
@@ -197,10 +197,11 @@ class MappingWorkflowOrderTest(unittest.TestCase):
     def test_k59_mapping_precedes_flanking(self):
         events = self.run_workflow([21, 39, 59, 79])
         mapping_index = events.index(('map_merged_reads', (59,)))
-        self.assertEqual(events[mapping_index - 2], ('local_assemble', (59, 79)))
+        self.assertEqual(events[mapping_index - 2], ('local_assemble', (59, 21)))
         self.assertEqual(events[mapping_index - 1], ('extract_contig_ends', (59,)))
         self.assertEqual(events[mapping_index + 1], ('extend_contig_ends', (59,)))
-        self.assertEqual(events[mapping_index + 2], ('iterate', (59, 20)))
+        self.assertEqual(events[mapping_index + 2][0], 'build_flanking_seed')
+        self.assertEqual(events[mapping_index + 2][1][::2], (59, 21))
         self.assertLess(mapping_index, events.index(('iterate', (59, 20))))
 
     def test_custom_last_reduction_k_is_used(self):
@@ -215,6 +216,87 @@ class MappingWorkflowOrderTest(unittest.TestCase):
 
     def test_no_next_k_does_not_extract_contig_ends(self):
         self.assertFalse(any(name == 'extract_contig_ends' for name, _ in self.run_workflow([21, 39, 59], merge_pairs=False)))
+
+    def test_restart_replays_full_k_list_after_k59(self):
+        events = self.run_workflow([21, 29, 39, 59, 79, 99, 119, 141])
+        seed_index = next(i for i, (name, _) in enumerate(events) if name == 'build_flanking_seed')
+        self.assertEqual([args[0] for name, args in events[:seed_index] if name == 'assemble'],
+                         [21, 29, 39, 59])
+        self.assertEqual([args[0] for name, args in events[seed_index:] if name == 'assemble'],
+                         [21, 29, 39, 59, 79, 99, 119, 141])
+        self.assertEqual([args for name, args in events if name == 'iterate'],
+                         [(21, 8), (29, 10), (39, 20), (59, 20), (79, 20), (99, 20), (119, 22)])
+
+    def test_restart_paths_do_not_overwrite_reduction_outputs(self):
+        launcher = load_launcher()
+        with tempfile.TemporaryDirectory() as directory:
+            launcher.opt.out_dir = directory
+            launcher.opt.temp_dir = os.path.join(directory, 'tmp')
+            original = launcher.contig_prefix(59)
+            original_ends = launcher.contig_ends_path(59)
+            launcher.opt.flanking_phase = True
+            self.assertNotEqual(original, launcher.contig_prefix(59))
+            self.assertNotEqual(original_ends, launcher.contig_ends_path(59))
+            self.assertIn('/flanking/k21/', launcher.graph_prefix(21))
+
+    def test_seed_builder_uses_contigs_not_first_pass_edges(self):
+        launcher = load_launcher()
+        with tempfile.TemporaryDirectory() as directory:
+            launcher.opt.out_dir = directory
+            launcher.opt.temp_dir = directory
+            launcher.opt.flanking_phase = True
+            launcher.check_point.set_file(os.path.join(directory, 'checkpoints'))
+            source = os.path.join(directory, 'k59')
+            Path(source + '.local.fa').write_text('')
+            with mock.patch.object(launcher, 'run_sub_command') as run:
+                launcher.build_flanking_seed(59, source, 21)
+            command = run.call_args[0][0]
+            self.assertNotIn('--input_prefix', command)
+            self.assertEqual(command[command.index('--contig') + 1], source + '.contigs.fa')
+            self.assertIn('--local_contig', command)
+            self.assertEqual(command[command.index('-k') + 1], '21')
+            launcher.opt.no_local = True
+            with mock.patch.object(launcher, 'run_sub_command') as run:
+                launcher.build_flanking_seed(59, source, 21)
+            self.assertNotIn('--local_contig', run.call_args[0][0])
+
+    def test_cleanup_preserves_both_passes_consensus_outputs(self):
+        launcher = load_launcher()
+        with tempfile.TemporaryDirectory() as directory:
+            launcher.opt.out_dir = directory
+            launcher.opt.temp_dir = os.path.join(directory, 'tmp')
+            launcher.opt.merge_pairs = True
+            launcher.opt.keep_tmp_files = False
+            for phase in ['', 'flanking']:
+                folder = Path(launcher.opt.temp_dir) / phase / 'k59'
+                folder.mkdir(parents=True)
+                (folder / 'k59.contig_ends.fa').write_text('>end\nACGT\n')
+                (folder / '59.edges.0').write_text('scratch')
+                (folder / 'flank_mapping').mkdir()
+                (folder / 'flank_mapping/library.0.sam').write_text('alignment')
+            launcher.remove_temporary_files()
+            for phase in ['', 'flanking']:
+                folder = Path(launcher.opt.temp_dir) / phase / 'k59'
+                self.assertTrue((folder / 'k59.contig_ends.fa').is_file())
+                self.assertTrue((folder / 'flank_mapping/library.0.sam').is_file())
+                self.assertFalse((folder / '59.edges.0').exists())
+
+    def test_no_local_keeps_first_pass_standalones_in_seed_contigs(self):
+        launcher = load_launcher()
+        with tempfile.TemporaryDirectory() as directory:
+            launcher.opt.out_dir = directory
+            launcher.opt.temp_dir = directory
+            launcher.opt.k_min = 21
+            launcher.opt.k_max = 141
+            launcher.opt.no_local = True
+            launcher.opt.keep_tmp_files = True
+            launcher.check_point.set_file(os.path.join(directory, 'checkpoints'))
+            with mock.patch.object(launcher, 'run_sub_command') as run:
+                launcher.assemble(59, 'graph')
+                self.assertNotIn('--output_standalone', run.call_args[0][0])
+                launcher.opt.flanking_phase = True
+                launcher.assemble(59, 'graph')
+                self.assertIn('--output_standalone', run.call_args[0][0])
 
     def test_consensus_runs_at_every_flanking_transition(self):
         events = self.run_workflow([59, 79, 99, 119])

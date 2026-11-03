@@ -24,6 +24,7 @@ import bz2
 import filecmp
 import getopt
 import gzip
+import io
 import json
 import logging
 import multiprocessing
@@ -106,7 +107,7 @@ Optional Arguments:
     --out-prefix             <string>       output prefix (the contig file will be OUT_DIR/OUT_PREFIX.contigs.fa)
     --min-contig-len         <int>          minimum length of contigs to output [200]
     --keep-tmp-files                        keep all temporary files
-    --no-human-readable-output              disable extra text edge/debug reports in tmp directories
+    --no-human-readable-output              disable extra text edge/debug reports (already disabled by default)
     --tmp-dir                <string>       set temp directory
 
 Other Arguments:
@@ -204,7 +205,7 @@ class Options:
         self.out_prefix = ''
         self.kmin_1pass = False
         self.debug_assembly = False
-        self.human_readable_output = True
+        self.human_readable_output = False
         self.merge_pairs = False
         self.flash_min_overlap = 10
         self.flash_max_overlap = 65
@@ -230,7 +231,7 @@ class Options:
 
     @property
     def contig_dir(self):
-        return os.path.join(self.out_dir, 'intermediate_contigs')
+        return phase_directory(os.path.join(self.out_dir, 'intermediate_contigs'))
 
     @property
     def read_lib_path(self):
@@ -678,9 +679,14 @@ def cpu_dispatch():
                         'because the features not detected by CPUID ')
 
 
+def phase_directory(directory):
+    return os.path.join(directory, 'flanking') if getattr(opt, 'flanking_phase', False) else directory
+
+
 def graph_prefix(kmer_k):
-    mkdir_if_not_exists(os.path.join(opt.temp_dir, 'k' + str(kmer_k)))
-    return os.path.join(opt.temp_dir, 'k' + str(kmer_k), str(kmer_k))
+    directory = os.path.join(phase_directory(opt.temp_dir), 'k' + str(kmer_k))
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, str(kmer_k))
 
 
 def read_count_prefix_path(kmer_k):
@@ -737,7 +743,8 @@ def contig_prefix(kmer_k):
 
 
 def contig_ends_path(cur_k):
-    return os.path.join(opt.out_dir, 'tmp', 'k' + str(cur_k), 'k{}.contig_ends.fa'.format(cur_k))
+    return os.path.join(phase_directory(os.path.join(opt.out_dir, 'tmp')),
+                        'k' + str(cur_k), 'k{}.contig_ends.fa'.format(cur_k))
 
 
 def extract_contig_ends(cur_k, flank_length=290):
@@ -914,6 +921,8 @@ def merge_paired_reads():
             cmd += input_paths
             run_sub_command(cmd, 'Merge paired-end library {} with FLASH'.format(i), verbose=True)
             output = os.path.join(flash_dir, prefix + '.merged.fa.gz')
+            logger.info('Convert FLASH library %d to gzip FASTA (compression level 1)', i)
+            conversion_start = time.monotonic()
             try:
                 fastq_to_fasta_gz(os.path.join(work_dir, prefix + '.extendedFrags.fastq'),
                                   output + '.tmp')
@@ -921,7 +930,8 @@ def merge_paired_reads():
             finally:
                 remove_if_exists(output + '.tmp')
             outputs.append(output)
-            logger.info('Merged FASTA: %s', output)
+            logger.info('Merged FASTA: %s (conversion %.2f seconds)',
+                        output, time.monotonic() - conversion_start)
     with open(manifest + '.tmp', 'w') as f:
         json.dump(outputs, f)
     os.replace(manifest + '.tmp', manifest)
@@ -929,7 +939,9 @@ def merge_paired_reads():
 
 def fastq_to_fasta_gz(source_path, output_path):
     # FLASH emits normalized four-line FASTQ records, even for multiline inputs.
-    with open(source_path, 'rb') as source, gzip.open(output_path, 'wb') as dest:
+    with open(source_path, 'rb') as source, \
+            gzip.open(output_path, 'wb', compresslevel=1) as compressed, \
+            io.BufferedWriter(compressed, buffer_size=1024 * 1024) as dest:
         while True:
             header = source.readline()
             if not header:
@@ -967,7 +979,7 @@ def map_merged_reads(cur_k):
         logger.warning('Skip merged-read mapping: no contig ends at k = %d', cur_k)
         return
 
-    output_dir = os.path.join(opt.out_dir, 'tmp', 'k' + str(cur_k), 'flank_mapping')
+    output_dir = os.path.join(os.path.dirname(reference), 'flank_mapping')
     os.makedirs(output_dir, exist_ok=True)
     manifest = os.path.join(output_dir, 'mapping.json')
     parameters = ['-x', 'sr', '-a', '-Y', '-t', str(opt.num_cpu_threads), '-I', '55G']
@@ -1002,7 +1014,7 @@ def extend_contig_ends(cur_k):
     if not opt.merge_pairs:
         return
     reference = contig_ends_path(cur_k)
-    output_dir = os.path.join(opt.out_dir, 'tmp', 'k' + str(cur_k), 'flank_mapping')
+    output_dir = os.path.join(os.path.dirname(reference), 'flank_mapping')
     mapping_manifest = os.path.join(output_dir, 'mapping.json')
     if not os.path.isfile(mapping_manifest) or not os.path.isfile(reference) or os.path.getsize(reference) == 0:
         return
@@ -1060,9 +1072,18 @@ def remove_temporary_files():
             else:
                 os.remove(entry.path)
 
-        for entry in os.scandir(opt.temp_dir):
+        def clean_directory(directory):
+            for entry in os.scandir(directory):
+                if entry.name == 'flanking' and entry.is_dir(follow_symlinks=False):
+                    clean_directory(entry.path)
+                    if not os.listdir(entry.path):
+                        os.rmdir(entry.path)
+                else:
+                    clean_entry(entry)
+
+        def clean_entry(entry):
             if opt.merge_pairs and entry.name == 'flash' and entry.is_dir(follow_symlinks=False):
-                continue
+                return
             if (entry.name.startswith('k') and entry.name[1:].isdigit()
                     and entry.is_dir(follow_symlinks=False)):
                 children = list(os.scandir(entry.path))
@@ -1080,6 +1101,7 @@ def remove_temporary_files():
                             remove_entry(child)
             else:
                 remove_entry(entry)
+        clean_directory(opt.temp_dir)
         if not os.listdir(opt.temp_dir):
             os.rmdir(opt.temp_dir)
     else:
@@ -1412,6 +1434,24 @@ def build_graph(kmer_k, kmer_from):
 
 
 @check_point
+def build_flanking_seed(source_k, source_prefix, seed_k):
+    # Do not reuse read-count edges from the first pass at this smaller k.
+    command = [opt.megahit_core, 'seq2sdbg',
+               '--host_mem', str(opt.host_mem), '--mem_flag', str(opt.mem_flag),
+               '--num_cpu_threads', str(opt.num_cpu_threads),
+               '--output_prefix', graph_prefix(seed_k),
+               '-k', str(seed_k), '--kmer_from', str(source_k),
+               '--contig', source_prefix + '.contigs.fa',
+               '--bubble', source_prefix + '.bubble_seq.fa']
+    for option, suffix in [('--addi_contig', '.addi.fa'), ('--local_contig', '.local.fa')]:
+        if option == '--local_contig' and opt.no_local:
+            continue
+        if os.path.isfile(source_prefix + suffix):
+            command += [option, source_prefix + suffix]
+    run_sub_command(command, 'Seed flanking k = %d from k = %d contigs' % (seed_k, source_k))
+
+
+@check_point
 def iterate(cur_k, step):
     next_k = cur_k + step
     iterate_cmd = [opt.megahit_core, 'iterate',
@@ -1482,7 +1522,8 @@ def assemble(cur_k, graph_input_prefix=None, next_k=None):
             assembly_cmd += ['--pruned_unitig',
                              contig_prefix(cur_k) + '.pruned_unitigs.fa']
 
-    if opt.no_local:
+    # First-pass standalone contigs must stay in the input to the restarted graph.
+    if opt.no_local and (getattr(opt, 'flanking_phase', False) or opt.k_min > REDUCTION_MAX_K):
         assembly_cmd.append('--output_standalone')
 
     run_sub_command(assembly_cmd, 'Assemble contigs from SdBG for k = %d' % cur_k)
@@ -1593,6 +1634,8 @@ def main(argv=None):
         start_time = time.time()
         check_bin()
         parse_option(argv[1:])
+        opt.flanking_phase = False
+        opt.human_readable_output = False
         setup_output_dir()
         setup_logger()
 
@@ -1615,7 +1658,7 @@ def main(argv=None):
 
         try:
             reduction_k_list = [k for k in opt.k_list if k <= REDUCTION_MAX_K]
-            flanking_k_list = [k for k in opt.k_list if k > REDUCTION_MAX_K]
+            flanking_k_list = opt.k_list[1:]
             first_graph_built = build_first_graph(bool(reduction_k_list))
 
             if reduction_k_list:
@@ -1648,11 +1691,17 @@ def main(argv=None):
                     # contig, bubble, and additional-contig inputs required by
                     # the original flanking iteration.
                     assemble(cur_k, graph_input)
-                if not flanking_k_list or opt.no_local:
-                    if flanking_k_list or opt.merge_pairs:
-                        extract_contig_ends(cur_k)
-                    map_merged_reads(cur_k)
-                    extend_contig_ends(cur_k)
+                if not opt.no_local:
+                    local_assemble(cur_k, opt.k_min)
+                source_prefix = contig_prefix(cur_k)
+                source_k = cur_k
+                opt.flanking_phase = True
+                os.makedirs(opt.contig_dir, exist_ok=True)
+                logger.info('Restarting consensus flanking assembly at k = %d from k = %d',
+                            opt.k_min, source_k)
+                build_flanking_seed(source_k, source_prefix, opt.k_min)
+                cur_k = opt.k_min
+                assemble(cur_k, graph_prefix(cur_k))
             else:
                 cur_k = opt.k_min
                 if not first_graph_built:
@@ -1660,7 +1709,7 @@ def main(argv=None):
                 assemble(cur_k, graph_prefix(cur_k))
 
             if flanking_k_list:
-                logger.info('Switching to original flanking workflow after k = %d',
+                logger.info('Running consensus flanking workflow from k = %d',
                             cur_k)
 
             for next_k in flanking_k_list:

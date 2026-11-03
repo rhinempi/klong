@@ -25,6 +25,9 @@ with multiple threads output order may vary, but mates remain associated.
 
 Each paired library produces `OUT_DIR/tmp/flash/library.N.merged.fa.gz`,
 containing only successfully merged sequences in gzip-compressed FASTA.
+Conversion uses buffered writes and gzip level 1 to avoid the expensive
+single-threaded level-9 compression default. Sequence content is unchanged;
+the compressed file is larger. Conversion start and elapsed time are logged.
 Libraries are numbered from zero, with separate-file pairs first, followed
 by interleaved inputs. A library with no mergeable pairs produces a valid
 empty gzip file. Single-end inputs are not included in the merged export.

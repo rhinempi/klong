@@ -3,6 +3,8 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #include <fstream>
 #include <memory>
@@ -23,6 +25,7 @@ class EdgeWriter {
   std::vector<int64_t> n_edges_at_thread_;
 
   bool is_opened_;
+  bool human_readable_;
 
  public:
   class Snapshot {
@@ -32,7 +35,7 @@ class EdgeWriter {
     friend class EdgeWriter;
   };
 
-  EdgeWriter() : is_opened_(false){};
+  EdgeWriter() : is_opened_(false), human_readable_(HumanReadableOutputEnabled()){};
   ~EdgeWriter() { Finalize(); }
 
   void SetKmerSize(uint32_t k) {
@@ -61,10 +64,12 @@ class EdgeWriter {
       files_.emplace_back(new std::ofstream(
           (file_prefix_ + ".edges." + std::to_string(i)).c_str(),
           std::ofstream::binary | std::ofstream::out));
-      text_files_.emplace_back(new std::ofstream(
-          (file_prefix_ + ".edges." + std::to_string(i) + ".txt").c_str(),
-          std::ofstream::out));
-      *text_files_.back() << "#edge\tmultiplicity\n";
+      if (human_readable_) {
+        text_files_.emplace_back(new std::ofstream(
+            (file_prefix_ + ".edges." + std::to_string(i) + ".txt").c_str(),
+            std::ofstream::out));
+        *text_files_.back() << "#edge\tmultiplicity\n";
+      }
     }
 
     is_opened_ = true;
@@ -121,6 +126,11 @@ class EdgeWriter {
   }
 
  private:
+  static bool HumanReadableOutputEnabled() {
+    const char *value = std::getenv("MEGAHIT_HUMAN_READABLE_OUTPUT");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+  }
+
   static char DecodeBase(uint32_t *edge_ptr, unsigned index) {
     static const char bases[] = {'A', 'C', 'G', 'T'};
     unsigned word = index / kCharsPerEdgeWord;
@@ -130,6 +140,7 @@ class EdgeWriter {
   }
 
   void WriteText(uint32_t *edge_ptr, int tid) const {
+    if (!human_readable_) return;
     assert(tid >= 0 && tid < static_cast<int>(text_files_.size()));
     auto &out = *text_files_[tid];
     for (unsigned i = 0; i < metadata_.kmer_size + 1; ++i) {

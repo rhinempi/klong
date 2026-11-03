@@ -224,6 +224,40 @@ class FlashIntegrationTest(unittest.TestCase):
         self.assertEqual(sequences(self.merged_path()), [self.fragment])
 
 
+class FastaConversionTest(unittest.TestCase):
+    def test_fast_compression_preserves_headers_and_sequences(self):
+        launcher = load_launcher()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'merged.fastq'
+            output = Path(directory) / 'merged.fa.gz'
+            source.write_bytes(b'@read1 description\r\nACGT\r\n+\r\nIIII\r\n'
+                               b'@read2\nGATTACA\n+\nIIIIIII\n')
+            with mock.patch.object(launcher.gzip, 'open', wraps=gzip.open) as opener:
+                launcher.fastq_to_fasta_gz(str(source), str(output))
+                self.assertEqual(opener.call_args.kwargs['compresslevel'], 1)
+            self.assertEqual(gzip.decompress(output.read_bytes()),
+                             b'>read1 description\nACGT\n>read2\nGATTACA\n')
+
+    def test_empty_input_is_a_valid_empty_gzip(self):
+        launcher = load_launcher()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'empty.fastq'
+            output = Path(directory) / 'empty.fa.gz'
+            source.write_bytes(b'')
+            launcher.fastq_to_fasta_gz(str(source), str(output))
+            self.assertEqual(gzip.decompress(output.read_bytes()), b'')
+
+    def test_invalid_fastq_is_rejected(self):
+        launcher = load_launcher()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'invalid.fastq'
+            output = Path(directory) / 'invalid.fa.gz'
+            for data in [b'read\nACGT\n+\nIIII\n', b'@read\nACGT\n+\nIII\n']:
+                source.write_bytes(data)
+                with self.assertRaises(launcher.Usage):
+                    launcher.fastq_to_fasta_gz(str(source), str(output))
+
+
 class FlashOptionsTest(unittest.TestCase):
     def test_options_parse(self):
         launcher = load_launcher()
