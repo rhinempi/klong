@@ -198,5 +198,11 @@ add_custom_target(native_workflow_test
         DEPENDS megahit
         VERBATIM)
 
+add_custom_target(reduction_test
+        COMMAND ${CMAKE_COMMAND} -E env "MEGAHIT_TEST_CORE=$<TARGET_FILE:megahit_core>"
+                python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_reduce.py
+        DEPENDS megahit_core
+        VERBATIM)
+
 install(TARGETS megahit DESTINATION bin)
 install(DIRECTORY test_data DESTINATION share/${PROJECT_NAME})

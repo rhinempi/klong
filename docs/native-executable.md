@@ -54,6 +54,15 @@ follows the full requested k-list. The same 290-base end extraction, Minimap2
 parameters, extended-only consensus local files, and binary edge formats are used.
 Final contigs are filtered and merged in C++ without shell pipelines.
 
+Look-ahead counting retains only binary `.edges.*` files; it does not build a
+preliminary read-counted SdBG. Reduction and merging consume those edges directly.
+SdBG construction occurs only for the reduced/merged edges that will be assembled
+and for the subsequent flanking assembly graphs. Native checkpoints from earlier
+versions remain usable; obsolete read-counted graph checkpoints are ignored.
+Reduction uses bounded block I/O, packed-word operations, and chunk-based workers;
+its Bloom allocation now receives the workflow memory budget. See
+[Edge Reduction Performance](reduction-performance.md) for parameters and benchmarks.
+
 Native runs write `options.json` with `workflow_driver: native-cpp-v1` and
 `checkpoints.native.json`. Resume validates input paths, sizes, and modification
 times, then reuses completed stages with existing outputs. A missing stage output

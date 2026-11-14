@@ -138,6 +138,43 @@ class NativeWorkflowTest(unittest.TestCase):
         # Completed-run continuation does not attempt to rebuild removed scratch.
         self.invoke(['--continue', '-o', output])
 
+    def test_reduction_keeps_counted_edges_without_preliminary_graphs(self):
+        output = self.assemble('edges-only reduction', extra=['-t', '1'])
+        commands = [json.loads(line[line.index('["--core"'):])
+                    for line in (output / 'log').read_text().splitlines()
+                    if 'command ' in line and '["--core"' in line]
+        graphs = [args for args in commands if args[1] == 'seq2sdbg']
+        reductions = [args for args in commands if args[1:4] == ['prefixbf', '--mode', 'reduce']]
+        self.assertTrue(reductions)
+        for args in reductions:
+            self.assertEqual(args[args.index('--host_mem') + 1], '200000000')
+        for k in (39, 59):
+            prefix = output / 'tmp/k{}/read_count/{}'.format(k, k)
+            self.assertTrue(Path(str(prefix) + '.edges.info').exists())
+            self.assertTrue(list(prefix.parent.glob(str(k) + '.edges.[0-9]*')))
+            self.assertFalse(Path(str(prefix) + '.sdbg_info').exists())
+            self.assertFalse(any(args[args.index('--output_prefix') + 1] == str(prefix)
+                                 for args in graphs))
+        for k in (21, 39, 59):
+            self.assertTrue((output / 'tmp/k{}/assembly_graph/{}.sdbg_info'.format(k, k)).exists())
+
+        # Native checkpoints from before this optimization may contain the
+        # retired stages; resume must not require or rebuild their graphs.
+        checkpoint = output / 'checkpoints.native.json'
+        state = json.loads(checkpoint.read_text())
+        state.update({'read-count-graph-k39': True, 'read-count-graph-k59': True})
+        checkpoint.write_text(json.dumps(state))
+        final = output / 'final.contigs.fa'
+        before = final.read_bytes()
+        final.unlink()
+        (output / 'done').unlink()
+        previous_log = (output / 'log').read_text()
+        self.invoke(['--continue', '-o', output])
+        self.assertEqual(final.read_bytes(), before)
+        state = json.loads(checkpoint.read_text())
+        self.assertFalse(any(key.startswith('read-count-graph-') for key in state))
+        self.assertNotIn('Build graph for k =', (output / 'log').read_text()[len(previous_log):])
+
     @unittest.skipUnless(ZLIB_ONLY, 'set MEGAHIT_TEST_NATIVE_ZLIB to test the no-pigz executable')
     def test_native_zlib_fallback(self):
         binary = self.root / 'megahit-zlib'

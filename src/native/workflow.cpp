@@ -507,7 +507,6 @@ class Driver {
             "--num_cpu_threads", number(opt.num_cpu_threads), "--read_lib_file", lib()},
            "Extract read-counted (k+1)-mers for k = " + number(k));
     });
-    if (!first) graph_edges(k, output, output, "read-count-graph-k" + number(k));
   }
   void graph_edges(int k, const std::string &input, const std::string &output, const std::string &name) {
     checkpoint(name, {output + ".sdbg_info"}, [&]() {
@@ -533,8 +532,8 @@ class Driver {
       core({"prefixbf", "--mode", "reduce", "--short_prefix", input, "--long_prefix", longer,
             "--output_prefix", output, "--short_k", number(from), "--long_k", number(to),
             "--num_cpu_threads", number(opt.num_cpu_threads), "--human_readable", "0",
-            "--max_bloom_gb", "60", "--reserve_gb", "1"},
-           "Reduce edges for k = " + number(from) + " using k = " + number(to));
+            "--max_bloom_gb", "60", "--reserve_gb", "1", "--host_mem", number(host_mem)},
+           "Reduce edges for k = " + number(from) + " using k = " + number(to), true);
     });
     return output;
   }

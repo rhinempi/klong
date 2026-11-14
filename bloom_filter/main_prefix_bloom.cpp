@@ -1,12 +1,12 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -30,6 +30,7 @@ namespace {
 constexpr uint64_t kDefaultMaxBloomBytes = 60ULL * 1024 * 1024 * 1024;
 constexpr uint64_t kSplitMixSeed = 0x9e3779b97f4a7c15ULL;
 constexpr uint32_t kContigEdgeMultiplicity = 50;
+constexpr size_t kEdgeBufferBytes = 1ULL << 20;
 
 struct Options {
   std::string mode{"reduce"};
@@ -44,6 +45,8 @@ struct Options {
   double max_bloom_gb{60.0};
   double reserve_gb{1.0};
   int max_hashes{16};
+  double host_mem{0};
+  double reduce_fpr{1e-15};
   int human_readable{0};
 };
 
@@ -65,9 +68,9 @@ uint64_t SplitMix64(uint64_t x) {
   return x ^ (x >> 31);
 }
 
-uint64_t HashKey(const KmerKey &key, uint64_t seed) {
+uint64_t HashKey(const KmerKey &key, uint64_t seed, int words = KmerKey::kWords) {
   uint64_t h = seed;
-  for (int i = 0; i < KmerKey::kWords; ++i) {
+  for (int i = 0; i < words; ++i) {
     h = SplitMix64(h ^ key.words[i]);
   }
   return h;
@@ -126,22 +129,21 @@ KmerKey PackedKeySlice(const KmerKey &key, unsigned offset, unsigned length) {
   return result;
 }
 
+uint64_t ReverseComplementWord(uint64_t word) {
+  uint64_t x = ~word;
+  x = ((x >> 2) & 0x3333333333333333ULL) | ((x & 0x3333333333333333ULL) << 2);
+  x = ((x >> 4) & 0x0f0f0f0f0f0f0f0fULL) | ((x & 0x0f0f0f0f0f0f0f0fULL) << 4);
+  x = ((x >> 8) & 0x00ff00ff00ff00ffULL) | ((x & 0x00ff00ff00ff00ffULL) << 8);
+  x = ((x >> 16) & 0x0000ffff0000ffffULL) | ((x & 0x0000ffff0000ffffULL) << 16);
+  return (x >> 32) | (x << 32);
+}
+
 KmerKey PackedReverseComplement(const KmerKey &key, unsigned length) {
-  KmerKey result;
-  if (length <= 32) {
-    uint64_t x = ~key.words[0];
-    x = ((x >> 2) & 0x3333333333333333ULL) | ((x & 0x3333333333333333ULL) << 2);
-    x = ((x >> 4) & 0x0f0f0f0f0f0f0f0fULL) | ((x & 0x0f0f0f0f0f0f0f0fULL) << 4);
-    x = ((x >> 8) & 0x00ff00ff00ff00ffULL) | ((x & 0x00ff00ff00ff00ffULL) << 8);
-    x = ((x >> 16) & 0x0000ffff0000ffffULL) | ((x & 0x0000ffff0000ffffULL) << 16);
-    x = (x >> 32) | (x << 32);
-    result.words[0] = length == 32 ? x : x << (64 - 2 * length);
-  } else {
-    for (unsigned i = 0; i < length; ++i) {
-      SetPackedBase(&result, i, 3 - PackedKeyBase(key, length - 1 - i));
-    }
-  }
-  return result;
+  KmerKey reversed;
+  unsigned words = (length + 31) / 32;
+  for (unsigned i = 0; i < words; ++i)
+    reversed.words[i] = ReverseComplementWord(key.words[words - 1 - i]);
+  return PackedKeySlice(reversed, words * 32 - length, length);
 }
 
 class MergeQueryIndex {
@@ -268,20 +270,24 @@ KmerKey CanonicalKeyFromEdge(const uint32_t *edge, unsigned offset,
 
 KmerKey RawKeyFromEdge(const uint32_t *edge, unsigned offset, unsigned len) {
   KmerKey key;
-  for (unsigned i = 0; i < len; ++i) {
-    SetPackedBase(&key, i, GetBase(edge, offset + i));
+  // Repack 32-bit edge words into 64-bit windows without visiting each base.
+  for (unsigned i = 0; i < (len + 31) / 32; ++i) {
+    unsigned start = offset + i * 32;
+    unsigned length = std::min(32U, len - i * 32);
+    unsigned word = start / 16, skip = start % 16, shift = skip * 2;
+    uint64_t packed = uint64_t{edge[word]} << 32;
+    if (skip + length > 16) packed |= edge[word + 1];
+    packed <<= shift;
+    if (skip + length > 32) packed |= uint64_t{edge[word + 2]} >> (32 - shift);
+    if (length < 32) packed &= ~uint64_t{0} << (64 - 2 * length);
+    key.words[i] = packed;
   }
   return key;
 }
 
 KmerKey RawReverseComplementKeyFromEdge(const uint32_t *edge, unsigned offset,
                                         unsigned len) {
-  KmerKey key;
-  for (unsigned i = 0; i < len; ++i) {
-    SetPackedBase(&key, i,
-                  static_cast<uint8_t>(3 - GetBase(edge, offset + len - 1 - i)));
-  }
-  return key;
+  return PackedReverseComplement(RawKeyFromEdge(edge, offset, len), len);
 }
 
 std::string ReverseComplement(const std::string &seq) {
@@ -353,9 +359,11 @@ uint64_t FileRecordCount(const std::string &prefix, const EdgeIoMetadata &meta,
   if (!meta.is_sorted) {
     std::ifstream is(prefix + ".edges." + std::to_string(file_id),
                      std::ifstream::binary | std::ifstream::ate);
-    if (!is) return 0;
-    return static_cast<uint64_t>(is.tellg()) /
-           (sizeof(uint32_t) * meta.words_per_edge);
+    if (!is) xfatal("Cannot open {s}.edges.{}\n", prefix.c_str(), file_id);
+    uint64_t bytes = static_cast<uint64_t>(is.tellg());
+    uint64_t stride = sizeof(uint32_t) * meta.words_per_edge;
+    if (stride == 0 || bytes % stride) xfatal("Invalid edge shard size for {s}.edges.{}\n", prefix.c_str(), file_id);
+    return bytes / stride;
   }
   uint64_t n = 0;
   for (const auto &bucket : meta.buckets) {
@@ -378,36 +386,73 @@ uint64_t AvailableMemoryBytes() {
   std::string key;
   uint64_t value_kb;
   std::string unit;
+  uint64_t available = 0;
   while (is >> key >> value_kb >> unit) {
-    if (key == "MemAvailable:") return value_kb * 1024ULL;
+    if (key == "MemAvailable:") { available = value_kb * 1024ULL; break; }
   }
-  return 0;
+  // MemAvailable describes the host, not necessarily the process's container.
+  auto apply_limit = [&](const std::string &limit_path, const std::string &usage_path) {
+    uint64_t limit, usage;
+    std::ifstream limit_file(limit_path), usage_file(usage_path);
+    if (limit_file >> limit && usage_file >> usage) {
+      uint64_t remaining = limit > usage ? limit - usage : 0;
+      if (!available || remaining < available) available = remaining;
+      if (remaining == 0) available = 1;
+    }
+  };
+  apply_limit("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current");
+  apply_limit("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+              "/sys/fs/cgroup/memory/memory.usage_in_bytes");
+  std::ifstream groups("/proc/self/cgroup");
+  std::string group;
+  while (std::getline(groups, group)) {
+    auto first = group.find(':'), last = group.rfind(':');
+    if (first == std::string::npos || last == first) continue;
+    std::string path = group.substr(last + 1);
+    if (path.empty() || path[0] != '/' || path.find("..") != std::string::npos) continue;
+    if (group.substr(0, last) == "0:") {
+      apply_limit("/sys/fs/cgroup" + path + "/memory.max",
+                  "/sys/fs/cgroup" + path + "/memory.current");
+    } else {
+      std::string controllers = "," + group.substr(first + 1, last - first - 1) + ",";
+      if (controllers.find(",memory,") != std::string::npos)
+        apply_limit("/sys/fs/cgroup/memory" + path + "/memory.limit_in_bytes",
+                    "/sys/fs/cgroup/memory" + path + "/memory.usage_in_bytes");
+    }
+  }
+  return available;
 }
 
 class BloomFilter {
  public:
-  BloomFilter(uint64_t num_bits, int num_hashes)
+  BloomFilter(uint64_t num_bits, int num_hashes,
+              int key_words = KmerKey::kWords, int threads = 1)
       : num_bits_(std::max<uint64_t>(64, num_bits)),
         num_words_((num_bits_ + 63) / 64),
         num_hashes_(std::max(1, num_hashes)),
+        key_words_(key_words),
+        bit_mask_((num_bits_ & (num_bits_ - 1)) == 0 ? num_bits_ - 1 : 0),
         words_(new std::atomic<uint64_t>[num_words_]) {
+#pragma omp parallel for schedule(static) num_threads(threads) if(num_words_ >= 131072)
     for (uint64_t i = 0; i < num_words_; ++i) words_[i].store(0, std::memory_order_relaxed);
   }
 
   void Add(const KmerKey &key) {
-    uint64_t h1 = HashKey(key, 0x243f6a8885a308d3ULL);
-    uint64_t h2 = HashKey(key, 0x13198a2e03707344ULL) | 1ULL;
+    uint64_t h1 = HashKey(key, 0x243f6a8885a308d3ULL, key_words_);
+    uint64_t h2 = HashKey(key, 0x13198a2e03707344ULL, key_words_) | 1ULL;
     for (int i = 0; i < num_hashes_; ++i) {
-      uint64_t bit = (h1 + static_cast<uint64_t>(i) * h2) % num_bits_;
+      uint64_t hash = h1 + static_cast<uint64_t>(i) * h2;
+      uint64_t bit = bit_mask_ ? hash & bit_mask_ : hash % num_bits_;
       words_[bit >> 6].fetch_or(1ULL << (bit & 63), std::memory_order_relaxed);
     }
   }
 
   bool Contains(const KmerKey &key) const {
-    uint64_t h1 = HashKey(key, 0x243f6a8885a308d3ULL);
-    uint64_t h2 = HashKey(key, 0x13198a2e03707344ULL) | 1ULL;
+    uint64_t h1 = HashKey(key, 0x243f6a8885a308d3ULL, key_words_);
+    uint64_t h2 = HashKey(key, 0x13198a2e03707344ULL, key_words_) | 1ULL;
     for (int i = 0; i < num_hashes_; ++i) {
-      uint64_t bit = (h1 + static_cast<uint64_t>(i) * h2) % num_bits_;
+      uint64_t hash = h1 + static_cast<uint64_t>(i) * h2;
+      uint64_t bit = bit_mask_ ? hash & bit_mask_ : hash % num_bits_;
       if ((words_[bit >> 6].load(std::memory_order_relaxed) & (1ULL << (bit & 63))) == 0) {
         return false;
       }
@@ -423,6 +468,8 @@ class BloomFilter {
   uint64_t num_bits_;
   uint64_t num_words_;
   int num_hashes_;
+  int key_words_;
+  uint64_t bit_mask_;
   std::unique_ptr<std::atomic<uint64_t>[]> words_;
 };
 
@@ -431,11 +478,13 @@ class EdgeOutputWriter {
   EdgeOutputWriter(const std::string &prefix, uint32_t k, uint32_t words_per_edge,
                    int num_files, bool human_readable)
       : prefix_(prefix), k_(k), words_per_edge_(words_per_edge),
-        human_readable_(human_readable), counts_(std::max(1, num_files), 0) {
+        human_readable_(human_readable), counts_(std::max(1, num_files), 0),
+        buffers_(std::max(1, num_files)) {
     int n = std::max(1, num_files);
     for (int i = 0; i < n; ++i) {
       binary_.emplace_back(new std::ofstream(prefix + ".edges." + std::to_string(i),
                                              std::ofstream::binary | std::ofstream::out));
+      if (!*binary_.back()) xfatal("Cannot open output edge shard {}\n", i);
       if (human_readable_) {
         text_.emplace_back(new std::ofstream(prefix + ".edges." + std::to_string(i) + ".txt"));
         *text_.back() << "#edge\tmultiplicity\tsource\n";
@@ -445,8 +494,10 @@ class EdgeOutputWriter {
 
   void Write(const uint32_t *edge, int file_id, const char *source) {
     file_id %= static_cast<int>(binary_.size());
-    binary_[file_id]->write(reinterpret_cast<const char *>(edge),
-                            sizeof(uint32_t) * words_per_edge_);
+    auto &buffer = buffers_[file_id];
+    if (buffer.capacity() == 0) buffer.reserve(kEdgeBufferBytes / sizeof(uint32_t) + words_per_edge_);
+    buffer.insert(buffer.end(), edge, edge + words_per_edge_);
+    if (buffer.size() * sizeof(uint32_t) >= kEdgeBufferBytes) Flush(file_id);
     if (human_readable_) {
       *text_[file_id] << BasesFromEdge(edge, 0, k_ + 1) << '\t'
                       << Multiplicity(edge, words_per_edge_) << '\t' << source << '\n';
@@ -455,7 +506,11 @@ class EdgeOutputWriter {
   }
 
   void Finalize() {
-    for (auto &f : binary_) f->close();
+    for (size_t i = 0; i < binary_.size(); ++i) {
+      Flush(i);
+      binary_[i]->close();
+      if (!*binary_[i]) xfatal("Failed to close output edge shard {}\n", i);
+    }
     for (auto &f : text_) f->close();
     EdgeIoMetadata meta;
     meta.kmer_size = k_;
@@ -466,9 +521,19 @@ class EdgeOutputWriter {
     for (auto c : counts_) meta.num_edges += c;
     std::ofstream info(prefix_ + ".edges.info");
     meta.Serialize(info);
+    info.close();
+    if (!info) xfatal("Failed to write edge metadata for {s}\n", prefix_.c_str());
   }
 
  private:
+  void Flush(size_t file_id) {
+    auto &buffer = buffers_[file_id];
+    if (buffer.empty()) return;
+    binary_[file_id]->write(reinterpret_cast<const char *>(buffer.data()),
+                           buffer.size() * sizeof(uint32_t));
+    if (!*binary_[file_id]) xfatal("Failed to write output edge shard {}\n", file_id);
+    buffer.clear();
+  }
   std::string prefix_;
   uint32_t k_;
   uint32_t words_per_edge_;
@@ -476,48 +541,113 @@ class EdgeOutputWriter {
   std::vector<std::unique_ptr<std::ofstream>> binary_;
   std::vector<std::unique_ptr<std::ofstream>> text_;
   std::vector<int64_t> counts_;
+  std::vector<std::vector<uint32_t>> buffers_;
 };
 
-void ForEachEdgeInFile(const std::string &prefix, const EdgeIoMetadata &meta,
-                       unsigned file_id,
-                       const std::function<void(const uint32_t *)> &fn) {
-  uint64_t n = FileRecordCount(prefix, meta, file_id);
+template <typename Fn>
+void ForEachEdgeRange(const std::string &prefix, const EdgeIoMetadata &meta,
+                     unsigned file_id, uint64_t first, uint64_t n, const Fn &fn) {
   if (n == 0) return;
 
   std::ifstream is(prefix + ".edges." + std::to_string(file_id),
                    std::ifstream::binary | std::ifstream::in);
   if (!is) xfatal("Cannot open {s}.edges.{}\n", prefix.c_str(), file_id);
 
-  std::vector<uint32_t> edge(meta.words_per_edge);
-  for (uint64_t i = 0; i < n; ++i) {
-    is.read(reinterpret_cast<char *>(edge.data()),
-            sizeof(uint32_t) * meta.words_per_edge);
+  if (meta.words_per_edge == 0) xfatal("Invalid zero-sized edge record\n");
+  is.seekg(first * sizeof(uint32_t) * meta.words_per_edge);
+  uint64_t block_records = std::max<uint64_t>(1, kEdgeBufferBytes /
+                                               (sizeof(uint32_t) * meta.words_per_edge));
+  std::vector<uint32_t> block(std::min(n, block_records) * meta.words_per_edge);
+  for (uint64_t begin = 0; begin < n; begin += block_records) {
+    uint64_t count = std::min(block_records, n - begin);
+    is.read(reinterpret_cast<char *>(block.data()),
+            count * sizeof(uint32_t) * meta.words_per_edge);
     if (!is) xfatal("Unexpected EOF reading {s}.edges.{}\n", prefix.c_str(), file_id);
-    fn(edge.data());
+    for (uint64_t i = 0; i < count; ++i) fn(block.data() + i * meta.words_per_edge);
   }
+}
+
+template <typename Fn>
+void ForEachEdgeInFile(const std::string &prefix, const EdgeIoMetadata &meta,
+                       unsigned file_id, const Fn &fn) {
+  ForEachEdgeRange(prefix, meta, file_id, 0, FileRecordCount(prefix, meta, file_id), fn);
+}
+
+struct EdgeRange {
+  unsigned file_id;
+  uint64_t first;
+  uint64_t count;
+};
+
+std::vector<EdgeRange> ReductionRanges(const std::string &prefix,
+                                      const EdgeIoMetadata &meta, int threads) {
+  if (meta.words_per_edge == 0) xfatal("Invalid zero-sized edge record\n");
+  uint64_t stride = sizeof(uint32_t) * meta.words_per_edge;
+  uint64_t tasks = static_cast<uint64_t>(threads) * 4;
+  uint64_t records = TotalRecords(meta);
+  uint64_t chunk = std::max<uint64_t>(std::max<uint64_t>(1, kEdgeBufferBytes / stride),
+                                      records / tasks + (records % tasks != 0));
+  std::vector<EdgeRange> ranges;
+  for (unsigned file = 0; file < meta.num_files; ++file) {
+    uint64_t count = FileRecordCount(prefix, meta, file);
+    for (uint64_t first = 0; first < count; first += chunk)
+      ranges.push_back({file, first, std::min(chunk, count - first)});
+  }
+  return ranges;
 }
 
 int ChooseHashCount(uint64_t bits, uint64_t items, int max_hashes) {
   if (items == 0) return 1;
   double optimal = (static_cast<double>(bits) / static_cast<double>(items)) * std::log(2.0);
-  return std::max(1, std::min(max_hashes, static_cast<int>(std::round(optimal))));
+  return static_cast<int>(std::max(1.0, std::min<double>(max_hashes, std::round(optimal))));
 }
 
 double EstimateFpr(uint64_t bits, uint64_t items, int hashes) {
   if (bits == 0) return 1.0;
   double exponent = -static_cast<double>(hashes) * static_cast<double>(items) /
                     static_cast<double>(bits);
-  return std::pow(1.0 - std::exp(exponent), hashes);
+  return std::pow(-std::expm1(exponent), hashes);
 }
 
-uint64_t SelectBloomByteCap(const Options &opt) {
+uint64_t SelectBloomByteCap(const Options &opt, uint64_t io_bytes = 0) {
   uint64_t requested = static_cast<uint64_t>(opt.max_bloom_gb * 1024.0 * 1024.0 * 1024.0);
   uint64_t reserve = static_cast<uint64_t>(opt.reserve_gb * 1024.0 * 1024.0 * 1024.0);
   uint64_t available = AvailableMemoryBytes();
-  if (requested == 0) requested = kDefaultMaxBloomBytes;
+  if (opt.max_bloom_gb == 0) requested = kDefaultMaxBloomBytes;
+  if (requested < 64) xfatal("Bloom memory cap must allow at least 64 bytes\n");
+  if (opt.host_mem) available = available ? std::min(available, static_cast<uint64_t>(opt.host_mem))
+                                        : static_cast<uint64_t>(opt.host_mem);
   if (available == 0) return requested;
-  if (available <= reserve + (256ULL << 20)) return 256ULL << 20;
-  return std::min(requested, available - reserve);
+  reserve = std::min(reserve, available / 8);
+  if (available <= reserve || available - reserve <= io_bytes + 64)
+    xfatal("Memory budget is too small for reduction I/O buffers; reduce thread count or raise --host_mem\n");
+  return std::min(requested, available - reserve - io_bytes);
+}
+
+struct ReductionBloomShape {
+  uint64_t bytes;
+  int hashes;
+  double estimated_fpr;
+};
+
+ReductionBloomShape SelectReductionBloom(uint64_t items, uint64_t cap, const Options &opt) {
+  if (cap < 64) xfatal("Bloom memory cap must allow at least 64 bytes\n");
+  items = std::max<uint64_t>(1, items);
+  int preferred = std::min(12, opt.max_hashes);
+  double bits = -static_cast<double>(preferred) * items /
+                std::log1p(-std::pow(opt.reduce_fpr, 1.0 / preferred));
+  uint64_t desired = static_cast<uint64_t>(std::min<double>(cap, std::ceil(bits / 8)));
+  desired = std::min(cap, std::max<uint64_t>(1ULL << 20, desired));
+  uint64_t bytes = 8;
+  while (bytes <= cap / 2 && bytes < desired) bytes *= 2;
+  if (bytes < desired) bytes = cap & ~uint64_t{7};
+  // A power-of-two bit array replaces integer division with a mask per probe.
+  int optimal = ChooseHashCount(bytes * 8, items, opt.max_hashes);
+  int hashes = optimal;
+  for (int h = 1; h <= optimal; ++h) {
+    if (EstimateFpr(bytes * 8, items, h) <= opt.reduce_fpr) { hashes = h; break; }
+  }
+  return {bytes, hashes, EstimateFpr(bytes * 8, items, hashes)};
 }
 
 bool ReadNextFasta(std::ifstream *in, std::string *name, std::string *seq) {
@@ -562,6 +692,8 @@ Options ParseOptions(int argc, char **argv) {
   desc.AddOption("max_bloom_gb", "m", opt.max_bloom_gb, "max Bloom filter memory in GB");
   desc.AddOption("reserve_gb", "r", opt.reserve_gb, "RAM to leave unused in GB");
   desc.AddOption("max_hashes", "H", opt.max_hashes, "maximum number of Bloom hash probes");
+  desc.AddOption("host_mem", "", opt.host_mem, "total memory budget in bytes (0: available memory)");
+  desc.AddOption("reduce_fpr", "", opt.reduce_fpr, "target estimated false-positive rate for reduction");
   desc.AddOption("human_readable", "", opt.human_readable, "write human-readable debug reports");
   desc.Parse(argc, argv);
 
@@ -572,11 +704,20 @@ Options ParseOptions(int argc, char **argv) {
   }
   if (opt.num_threads <= 0) opt.num_threads = 1;
   if (opt.max_hashes <= 0) opt.max_hashes = 1;
+  if (!std::isfinite(opt.max_bloom_gb) || opt.max_bloom_gb < 0 || opt.max_bloom_gb > 1048576 ||
+      !std::isfinite(opt.reserve_gb) || opt.reserve_gb < 0 || opt.reserve_gb > 1048576 ||
+      !std::isfinite(opt.host_mem) || opt.host_mem < 0 || opt.host_mem >= 9e18 ||
+      !std::isfinite(opt.reduce_fpr) || opt.reduce_fpr <= 0 || opt.reduce_fpr >= 1 ||
+      opt.max_hashes > 64 ||
+      opt.short_k > kMaxK || opt.long_k > kMaxK)
+    xfatal("Invalid Bloom memory, false-positive target, or k-mer size\n");
   opt.human_readable = opt.human_readable != 0 ? 1 : 0;
   return opt;
 }
 
 int RunReduce(const Options &opt) {
+  using Clock = std::chrono::steady_clock;
+  const auto started = Clock::now();
   EdgeIoMetadata short_meta = LoadMetadata(opt.short_prefix);
   EdgeIoMetadata long_meta = LoadMetadata(opt.long_prefix);
   if (short_meta.kmer_size != opt.short_k || long_meta.kmer_size != opt.long_k) {
@@ -591,23 +732,37 @@ int RunReduce(const Options &opt) {
            long_edge_len, short_edge_len);
   }
 
+  auto long_ranges = ReductionRanges(opt.long_prefix, long_meta, opt.num_threads);
+  auto short_ranges = ReductionRanges(opt.short_prefix, short_meta, opt.num_threads);
+
   uint64_t long_records = TotalRecords(long_meta);
   uint64_t bloom_insertions = long_records * 2;
-  uint64_t bloom_byte_cap = SelectBloomByteCap(opt);
-  uint64_t target_bytes = std::max<uint64_t>(64ULL << 20, bloom_insertions * 64ULL);
-  uint64_t bloom_bytes = std::min(bloom_byte_cap, target_bytes);
-  BloomFilter longer_prefixes(bloom_bytes * 8,
-                              ChooseHashCount(bloom_bytes * 8,
-                                              std::max<uint64_t>(1, bloom_insertions),
-                                              opt.max_hashes));
+  uint64_t bloom_byte_cap = SelectBloomByteCap(opt, 2 * kEdgeBufferBytes * opt.num_threads);
+  ReductionBloomShape shape = SelectReductionBloom(bloom_insertions, bloom_byte_cap, opt);
+  BloomFilter longer_prefixes(shape.bytes * 8, shape.hashes,
+                              (short_edge_len + 31) / 32, opt.num_threads);
+  std::ostringstream fpr, requested_fpr;
+  fpr << std::scientific << std::setprecision(3) << shape.estimated_fpr;
+  requested_fpr << std::scientific << std::setprecision(3) << opt.reduce_fpr;
+  xinfo("Reduction Bloom: {} bytes, {} probes, {} active words, estimated FPR {s}, cap {} bytes\n",
+        shape.bytes, shape.hashes, (short_edge_len + 31) / 32,
+        fpr.str().c_str(), bloom_byte_cap);
+  xinfo("Reduction work: {} insertion chunks, {} filtering chunks, {} workers\n",
+        long_ranges.size(), short_ranges.size(), opt.num_threads);
+  if (shape.estimated_fpr > opt.reduce_fpr)
+    xinfo("WARNING: Bloom memory/hash cap prevents requested reduction FPR {s}; increase memory or --max_hashes\n",
+          requested_fpr.str().c_str());
+  const auto initialized = Clock::now();
   using OriginMap = std::unordered_map<KmerKey, std::vector<LongEdgeOrigin>, KmerKeyHash>;
   // Provenance is diagnostic only; reduction itself uses the packed Bloom keys.
   std::unique_ptr<OriginMap> longer_origin;
   if (opt.human_readable) longer_origin.reset(new OriginMap);
 
-#pragma omp parallel for schedule(dynamic) num_threads(opt.num_threads)
-  for (int file_id = 0; file_id < static_cast<int>(long_meta.num_files); ++file_id) {
-    ForEachEdgeInFile(opt.long_prefix, long_meta, file_id, [&](const uint32_t *edge) {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(opt.num_threads)
+  for (size_t i = 0; i < long_ranges.size(); ++i) {
+    const auto &range = long_ranges[i];
+    ForEachEdgeRange(opt.long_prefix, long_meta, range.file_id, range.first, range.count,
+                     [&](const uint32_t *edge) {
       KmerKey prefix_key = RawKeyFromEdge(edge, 0, short_edge_len);
       KmerKey rc_prefix_key = RawReverseComplementKeyFromEdge(
           edge, long_edge_len - short_edge_len, short_edge_len);
@@ -626,6 +781,8 @@ int RunReduce(const Options &opt) {
     });
   }
 
+  const auto populated = Clock::now();
+
   std::vector<std::ostringstream> removed_buffers(opt.human_readable ? opt.num_threads : 0);
   std::vector<std::ostringstream> non_removed_buffers(opt.human_readable ? opt.num_threads : 0);
   EdgeOutputWriter writer(opt.output_prefix, opt.short_k, short_meta.words_per_edge,
@@ -636,17 +793,22 @@ int RunReduce(const Options &opt) {
   std::atomic<uint64_t> reverse_only{0};
   std::atomic<uint64_t> no_orientation_hit{0};
 
-#pragma omp parallel for schedule(dynamic) num_threads(opt.num_threads)
-  for (int file_id = 0; file_id < static_cast<int>(short_meta.num_files); ++file_id) {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(opt.num_threads)
+  for (size_t i = 0; i < short_ranges.size(); ++i) {
     int tid = 0;
 #ifdef _OPENMP
     tid = omp_get_thread_num();
 #endif
-    std::vector<std::vector<uint32_t>> local_kept;
-    ForEachEdgeInFile(opt.short_prefix, short_meta, file_id, [&](const uint32_t *edge) {
+    const auto &range = short_ranges[i];
+    ForEachEdgeRange(opt.short_prefix, short_meta, range.file_id, range.first, range.count,
+                     [&](const uint32_t *edge) {
       KmerKey forward_key = RawKeyFromEdge(edge, 0, short_edge_len);
-      KmerKey reverse_key = RawReverseComplementKeyFromEdge(edge, 0, short_edge_len);
       bool forward_hit = longer_prefixes.Contains(forward_key);
+      if (!forward_hit && !opt.human_readable) {
+        writer.Write(edge, tid, "non_removed");
+        return;
+      }
+      KmerKey reverse_key = PackedReverseComplement(forward_key, short_edge_len);
       bool reverse_hit = longer_prefixes.Contains(reverse_key);
       if (forward_hit && reverse_hit) {
         if (!opt.human_readable) return;
@@ -683,7 +845,7 @@ int RunReduce(const Options &opt) {
                                << "NA" << '\n';
         }
       } else {
-        local_kept.push_back(std::vector<uint32_t>(edge, edge + short_meta.words_per_edge));
+        writer.Write(edge, tid, "non_removed");
         if (!opt.human_readable) return;
         ++kept;
         const char *keep_reason = "no_orientation_hit";
@@ -701,9 +863,14 @@ int RunReduce(const Options &opt) {
                                  << keep_reason << '\n';
       }
     });
-    for (const auto &edge : local_kept) writer.Write(edge.data(), tid, "non_removed");
   }
   writer.Finalize();
+  const auto filtered = Clock::now();
+  xinfo("Reduction seconds: initialize {}, insert {}, filter/write {}, total {}\n",
+        std::chrono::duration<double>(initialized - started).count(),
+        std::chrono::duration<double>(populated - initialized).count(),
+        std::chrono::duration<double>(filtered - populated).count(),
+        std::chrono::duration<double>(filtered - started).count());
 
   if (opt.human_readable) {
     std::ofstream removed_out(opt.output_prefix + ".removed.txt");
