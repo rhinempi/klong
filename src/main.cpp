@@ -73,7 +73,7 @@ void show_help(const char *program_name) {
       program_name);
 }
 
-int main(int argc, char **argv) {
+int megahit_core_main(int argc, char **argv) {
   if (argc < 2) {
     show_help(argv[0]);
     exit(1);

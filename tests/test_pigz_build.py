@@ -16,6 +16,7 @@ from unittest import mock
 from test_flash import load_launcher
 
 ROOT = Path(__file__).resolve().parents[1]
+LEGACY_CMAKE = os.environ.get('MEGAHIT_TEST_LEGACY_CMAKE')
 
 
 def load_file(name, path):
@@ -27,6 +28,42 @@ def load_file(name, path):
 
 
 class OptionalPigzFailureTest(unittest.TestCase):
+    def test_legacy_configure_form_and_absolute_paths(self):
+        helper = load_file('optional_pigz', ROOT / 'cmake/build_optional_pigz.py')
+        with tempfile.TemporaryDirectory(prefix='legacy pigz ') as directory:
+            build_dir = Path(directory) / 'build directory'
+            relative_source = os.path.relpath(ROOT / 'src/pigz')
+            relative_build = os.path.relpath(build_dir)
+            with mock.patch.object(helper.subprocess, 'run') as run:
+                result = helper.build_pigz(relative_source, relative_build)
+            self.assertEqual(result, build_dir / ('pigz.exe' if os.name == 'nt' else 'pigz'))
+            configure, build, verify = run.call_args_list
+            self.assertEqual(configure.args[0][1], str(ROOT / 'src/pigz'))
+            self.assertNotIn('-S', configure.args[0])
+            self.assertNotIn('-B', configure.args[0])
+            self.assertEqual(configure.kwargs['cwd'], str(build_dir))
+            self.assertEqual(build.args[0][:3], ['cmake', '--build', '.'])
+            self.assertEqual(build.kwargs['cwd'], str(build_dir))
+            self.assertEqual(verify.args[0], [str(result), '--version'])
+
+    @unittest.skipUnless(LEGACY_CMAKE, 'set MEGAHIT_TEST_LEGACY_CMAKE to test an older CMake')
+    def test_real_pre_313_cmake_packages_pigz(self):
+        with tempfile.TemporaryDirectory(prefix='legacy pigz ') as directory:
+            root = Path(directory)
+            generated = self.make_package(root, [
+                '--pigz-source', str(ROOT / 'src/pigz'), '--pigz-build-dir', str(root / 'build'),
+                '--pigz-cmake', LEGACY_CMAKE])
+            self.assertTrue(generated.PIGZ_B64, generated.build_output)
+            launcher, runtime_bin = self.prepare_launcher(generated, root)
+            version = subprocess.check_output([str(runtime_bin / 'pigz'), '--version'],
+                                              stderr=subprocess.STDOUT)
+            self.assertIn(b'pigz', version)
+            source, output = root / 'input.fastq', root / 'output.fa.gz'
+            source.write_bytes(b'@read\nACGT\n+\nIIII\n')
+            with mock.patch.dict(os.environ, {'PATH': ''}):
+                launcher.fastq_to_fasta_gz(str(source), str(output), num_threads=2)
+            self.assertEqual(gzip.decompress(output.read_bytes()), b'>read\nACGT\n')
+
     def test_failed_build_removes_stale_binary(self):
         helper = load_file('optional_pigz', ROOT / 'cmake/build_optional_pigz.py')
         with tempfile.TemporaryDirectory() as directory:

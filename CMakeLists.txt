@@ -40,6 +40,7 @@ if (STATIC_BUILD)
 endif (STATIC_BUILD)
 
 find_package(ZLIB REQUIRED)
+find_package(BZip2 REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(Threads REQUIRED)
 
@@ -99,7 +100,9 @@ set(MEGAHIT_CORE_SOURCE
         ${TOOLKIT_SOURCE}
         ${BLOOM_FILTER_SOURCE})
 
-add_executable(megahit_core ${MEGAHIT_CORE_SOURCE})
+add_library(megahit_objects OBJECT ${MEGAHIT_CORE_SOURCE})
+target_include_directories(megahit_objects PRIVATE ${ZLIB_INCLUDE_DIRS})
+add_executable(megahit_core EXCLUDE_FROM_ALL src/native/core_entry.cpp $<TARGET_OBJECTS:megahit_objects>)
 
 
 if (STATIC_BUILD)
@@ -111,39 +114,31 @@ endif (STATIC_BUILD)
 
 target_link_libraries(megahit_core ${ZLIB_LIBRARIES} flash minimap2)
 
-set(PIGZ_EMBED_OPTIONS)
 file(GLOB PIGZ_EMBED_DEPENDENCIES "${CMAKE_SOURCE_DIR}/src/pigz/*")
-if(BUNDLED_PIGZ)
-    list(APPEND PIGZ_EMBED_OPTIONS
-            --pigz-source ${CMAKE_SOURCE_DIR}/src/pigz
-            --pigz-build-dir ${CMAKE_CURRENT_BINARY_DIR}/optional-pigz
-            --pigz-cmake ${CMAKE_COMMAND}
-            --pigz-cc ${CMAKE_C_COMPILER})
-    if(ZLIB_INCLUDE_DIR)
-        list(APPEND PIGZ_EMBED_OPTIONS --pigz-zlib-include ${ZLIB_INCLUDE_DIR})
-    endif()
-    if(ZLIB_LIBRARY)
-        list(APPEND PIGZ_EMBED_OPTIONS --pigz-zlib-library ${ZLIB_LIBRARY})
-    endif()
-    if(STATIC_BUILD)
-        list(APPEND PIGZ_EMBED_OPTIONS --pigz-static)
-    endif()
-endif()
-
 add_custom_command(
-        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/megahit
-        COMMAND python3 ${CMAKE_SOURCE_DIR}/cmake/embed_megahit.py
-                --launcher ${CMAKE_SOURCE_DIR}/src/megahit
-                --core $<TARGET_FILE:megahit_core>
-                --output ${CMAKE_CURRENT_BINARY_DIR}/megahit
-                ${PIGZ_EMBED_OPTIONS}
-        DEPENDS megahit_core ${CMAKE_SOURCE_DIR}/src/megahit ${CMAKE_SOURCE_DIR}/cmake/embed_megahit.py
-                ${CMAKE_SOURCE_DIR}/cmake/build_optional_pigz.py ${PIGZ_EMBED_DEPENDENCIES}
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/native_pigz.cpp
+        COMMAND ${CMAKE_COMMAND}
+                "-DENABLE_PIGZ=${BUNDLED_PIGZ}" "-DPIGZ_SOURCE=${CMAKE_SOURCE_DIR}/src/pigz"
+                "-DPIGZ_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/optional-pigz-native"
+                "-DC_COMPILER=${CMAKE_C_COMPILER}" "-DZLIB_INCLUDE=${ZLIB_INCLUDE_DIR}"
+                "-DZLIB_LIBRARY=${ZLIB_LIBRARY}" "-DSTATIC_PIGZ=${STATIC_BUILD}"
+                "-DEXE_SUFFIX=${CMAKE_EXECUTABLE_SUFFIX}"
+                "-DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native_pigz.cpp"
+                -P ${CMAKE_SOURCE_DIR}/cmake/embed_native_pigz.cmake
+        DEPENDS ${CMAKE_SOURCE_DIR}/cmake/embed_native_pigz.cmake ${PIGZ_EMBED_DEPENDENCIES}
                 ${CMAKE_CURRENT_BINARY_DIR}/CMakeCache.txt
         VERBATIM)
 
-add_custom_target(embedded_megahit ALL
-        DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/megahit)
+add_executable(megahit src/native/entry.cpp src/native/platform.cpp src/native/workflow.cpp
+        ${CMAKE_CURRENT_BINARY_DIR}/native_pigz.cpp $<TARGET_OBJECTS:megahit_objects>)
+target_include_directories(megahit PRIVATE ${ZLIB_INCLUDE_DIRS} ${BZIP2_INCLUDE_DIR})
+target_compile_definitions(megahit PRIVATE MEGAHIT_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/test_data")
+target_link_libraries(megahit ${ZLIB_LIBRARIES} ${BZIP2_LIBRARIES} flash minimap2)
+if(STATIC_BUILD)
+    set_target_properties(megahit PROPERTIES LINK_SEARCH_START_STATIC ON LINK_SEARCH_END_STATIC ON)
+endif()
+# Retain the established build target name; its artifact is now a native ELF.
+add_custom_target(embedded_megahit ALL DEPENDS megahit)
 
 set(TEST_DATA ${CMAKE_SOURCE_DIR}/test_data)
 
@@ -197,5 +192,11 @@ add_custom_target(pigz_test
         COMMAND python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_pigz_build.py
         VERBATIM)
 
-install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/megahit DESTINATION bin)
+add_custom_target(native_workflow_test
+        COMMAND ${CMAKE_COMMAND} -E env "MEGAHIT_TEST_NATIVE=$<TARGET_FILE:megahit>"
+                python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_native_workflow.py
+        DEPENDS megahit
+        VERBATIM)
+
+install(TARGETS megahit DESTINATION bin)
 install(DIRECTORY test_data DESTINATION share/${PROJECT_NAME})

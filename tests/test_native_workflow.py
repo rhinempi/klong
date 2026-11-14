@@ -1,0 +1,208 @@
+"""Native runtime integration. Python is the test harness, never the workload."""
+import bz2
+import collections
+import gzip
+import hashlib
+import json
+import os
+from pathlib import Path
+import random
+import re
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+from test_flash import binary_sequences, fastq
+
+NATIVE = os.environ.get('MEGAHIT_TEST_NATIVE')
+ZLIB_ONLY = os.environ.get('MEGAHIT_TEST_NATIVE_ZLIB')
+
+
+def fasta(path):
+    opener = gzip.open if str(path).endswith('.gz') else open
+    with opener(path, 'rt') as source:
+        lines = source.read().splitlines()
+    return dict(zip(lines[::2], lines[1::2]))
+
+
+@unittest.skipUnless(NATIVE, 'set MEGAHIT_TEST_NATIVE to the native megahit executable')
+class NativeWorkflowTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workspace = tempfile.TemporaryDirectory(prefix='native workflow ')
+        cls.root = Path(cls.workspace.name)
+        cls.binary = cls.root / 'megahit'
+        shutil.copy2(NATIVE, cls.binary)
+        cls.environment = os.environ.copy()
+        cls.environment['PATH'] = ''
+        cls.environment['PYTHONHOME'] = '/no-python-installed'
+        cls.environment['PYTHONPATH'] = '/no-python-installed'
+        rng = random.Random(9182)
+        cls.genome = ''.join(rng.choice('ACGT') for _ in range(1400))
+        complement = str.maketrans('ACGT', 'TGCA')
+        cls.left, cls.right, cls.merged = [], [], []
+        for i in range(0, len(cls.genome) - 159, 8):
+            fragment = cls.genome[i:i + 160]
+            cls.left.append(('r{}/1'.format(i), fragment[:100]))
+            cls.right.append(('r{}/2'.format(i), fragment[-100:].translate(complement)[::-1]))
+            cls.merged.append(fragment)
+        cls.first, cls.second = cls.root / 'mate one.fq.gz', cls.root / 'mate two.fq.bz2'
+        with gzip.open(cls.first, 'wt') as output:
+            output.write(fastq(cls.left))
+        with bz2.open(cls.second, 'wt') as output:
+            output.write(fastq(cls.right))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.workspace.cleanup()
+
+    def invoke(self, arguments, check=True, binary=None):
+        return subprocess.run([str(binary or self.binary)] + list(map(str, arguments)),
+                              env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, check=check, timeout=120)
+
+    def assemble(self, label, extra=(), binary=None, reads=None, keep=True):
+        output = self.root / label
+        inputs = reads or ['-1', self.first, '-2', self.second]
+        self.invoke(inputs + (['--keep-tmp-files'] if keep else []) + ['--merge-pairs', '--k-list', '21,39,59,79',
+                              '--min-contig-len', '80', '-t', '2', '-m', '200000000',
+                              '-o', output] + list(extra), binary=binary)
+        return output
+
+    def test_native_elf_and_direct_core_dispatch(self):
+        with self.binary.open('rb') as source:
+            self.assertEqual(source.read(4), b'\x7fELF')
+        info = json.loads(self.invoke(['--native-info']).stdout)
+        self.assertFalse(info['python_required'])
+        self.assertTrue(info['core_linked'])
+        self.assertIn('native', self.invoke(['--version']).stdout)
+        self.assertEqual(self.invoke(['--core', 'kmax']).stdout.strip(), '255')
+        self.assertIn('FLASH', self.invoke(['flash', '--version']).stdout)
+        self.assertTrue(self.invoke(['minimap2', '--version']).stdout.strip())
+
+    def test_native_gzip_bzip2_and_concatenated_inputs(self):
+        for extension, encoder in [('gz', gzip.compress), ('bz2', bz2.compress)]:
+            source = self.root / ('concat.' + extension)
+            target = self.root / ('concat.' + extension + '.plain')
+            source.write_bytes(encoder(b'first\n') + encoder(b'second\n'))
+            self.invoke(['--native-decompress', source, target])
+            self.assertEqual(target.read_bytes(), b'first\nsecond\n')
+        corrupt = self.root / 'corrupt.gz'
+        corrupt.write_bytes(b'\x1f\x8bnot-gzip')
+        self.assertNotEqual(self.invoke(['--native-decompress', corrupt, self.root / 'bad'], check=False).returncode, 0)
+
+    def test_paired_workflow_without_python_and_resume(self):
+        output = self.assemble('paired output')
+        self.assertTrue((output / 'done').exists())
+        options = json.loads((output / 'options.json').read_text())
+        self.assertEqual(options['workflow_driver'], 'native-cpp-v1')
+        expected = [sequence for pair in zip(self.left, self.right) for _, sequence in pair]
+        self.assertEqual(binary_sequences(output / 'tmp/reads.lib.bin'), expected)
+        merged = fasta(output / 'tmp/flash/library.0.merged.fa.gz')
+        self.assertEqual(collections.Counter(merged.values()), collections.Counter(self.merged))
+        log = (output / 'log').read_text()
+        assembled = re.findall(r'Assemble contigs from SdBG for k = (\d+)', log)
+        order = list(map(int, assembled))
+        expected_order = [21, 39, 59, 21, 39, 59, 79]
+        # A perfectly resolved synthetic genome can legitimately terminate
+        # early when neither iterative edges nor consensus overhangs remain.
+        self.assertEqual(order, expected_order[:len(order)])
+        self.assertGreaterEqual(len(order), 4)
+        self.assertNotIn('--core","local"', log)
+        for phase, k in [('', 59), ('flanking/', 21), ('flanking/', 39), ('flanking/', 59)]:
+            local = output / ('intermediate_contigs/' + phase + 'k{}.local.fa'.format(k))
+            if k != 21 and phase and not local.exists():
+                continue
+            extended = output / ('tmp/' + phase + 'k{}/k{}.contig_ends.extended.fa'.format(k, k))
+            self.assertEqual(local.read_bytes(), extended.read_bytes())
+            self.assertEqual(Path(str(local) + '.info').read_bytes(), Path(str(extended) + '.info').read_bytes())
+            self.assertTrue((extended.parent / 'flank_mapping/library.0.sam').exists())
+        final = output / 'final.contigs.fa'
+        self.assertTrue(fasta(final))
+        before = final.read_bytes()
+        (output / 'done').unlink()
+        final.unlink()
+        self.invoke(['--continue', '-o', output])
+        self.assertEqual(final.read_bytes(), before)
+        self.assertIn('Reuse native checkpoint', (output / 'log').read_text())
+        self.invoke(['--continue', '-o', output])
+
+    def test_interleaved_gzip_workflow_and_cleanup(self):
+        interleaved = self.root / 'interleaved.fq.gz'
+        with gzip.open(interleaved, 'wt') as output:
+            output.write(fastq([record for pair in zip(self.left, self.right) for record in pair]))
+        output = self.assemble('interleaved', reads=['--12', interleaved])
+        self.assertEqual(collections.Counter(fasta(output / 'tmp/flash/library.0.merged.fa.gz').values()),
+                         collections.Counter(self.merged))
+        # Completed-run continuation does not attempt to rebuild removed scratch.
+        self.invoke(['--continue', '-o', output])
+
+    @unittest.skipUnless(ZLIB_ONLY, 'set MEGAHIT_TEST_NATIVE_ZLIB to test the no-pigz executable')
+    def test_native_zlib_fallback(self):
+        binary = self.root / 'megahit-zlib'
+        shutil.copy2(ZLIB_ONLY, binary)
+        self.assertFalse(json.loads(self.invoke(['--native-info'], binary=binary).stdout)['bundled_pigz'])
+        output = self.assemble('zlib-only', binary=binary)
+        self.assertIn('native C zlib', (output / 'log').read_text())
+        self.assertEqual(collections.Counter(fasta(output / 'tmp/flash/library.0.merged.fa.gz').values()),
+                         collections.Counter(self.merged))
+
+    def test_no_local_original_only_and_single_end(self):
+        source = self.root / 'single end.fa'
+        source.write_text(''.join('>s{}\n{}\n'.format(i, seq) for i, (_, seq) in enumerate(self.left)))
+        output = self.root / 'single-only'
+        self.invoke(['-r', source, '--no-local', '--k-list', '61,79', '--min-contig-len', '80',
+                     '-t', '2', '-m', '200000000', '-o', output])
+        self.assertTrue((output / 'done').exists())
+        self.assertFalse((output / 'tmp/reads.lib.bin').exists())
+        self.assertFalse((output / 'tmp/flash').exists())
+        self.assertNotIn('Restarting consensus', (output / 'log').read_text())
+
+    def test_export_preservation_and_custom_scratch_cleanup(self):
+        scratch = self.root / 'custom scratch'
+        output = self.assemble('cleaned output', extra=['--tmp-dir', scratch], keep=False)
+        options = json.loads((output / 'options.json').read_text())
+        self.assertFalse(Path(options['temp_dir']).exists())
+        self.assertTrue((output / 'tmp/flash/library.0.merged.fa.gz').exists())
+        self.assertTrue((output / 'tmp/k59/k59.contig_ends.extended.fa').exists())
+        self.assertTrue((output / 'tmp/flanking/k21/flank_mapping/library.0.sam').exists())
+        self.assertTrue((output / 'done').exists())
+
+    def test_corrupt_compressed_input_does_not_publish_completion(self):
+        corrupt = self.root / 'bad-input.fq.gz'
+        corrupt.write_bytes(b'\x1f\x8binvalid data')
+        output = self.root / 'failed input'
+        result = self.invoke(['-r', corrupt, '--k-list', '21', '-m', '200000000', '-t', '1', '-o', output], check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((output / 'done').exists())
+
+    def test_failed_rerun_invalidates_old_checkpoint_tail(self):
+        output = self.assemble('resume invalidation')
+        (output / 'done').unlink()
+        (output / 'final.contigs.fa').unlink()
+        library = output / 'tmp/reads.lib.bin'
+        library.unlink()
+        blocker = output / 'tmp/reads.lib.tmp'
+        blocker.mkdir()
+        failed = self.invoke(['--continue', '-o', output], check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        state = json.loads((output / 'checkpoints.native.json').read_text())
+        self.assertFalse(state.get('read-library', False))
+        blocker.rmdir()
+        library.write_bytes(b'partial data from an interrupted stage')
+        self.invoke(['--continue', '-o', output])
+        expected = [sequence for pair in zip(self.left, self.right) for _, sequence in pair]
+        self.assertEqual(binary_sequences(library), expected)
+        self.assertTrue((output / 'done').exists())
+
+    def test_rejects_legacy_checkpoints_and_bad_options(self):
+        for options in [['--k-step', '0'], ['--k-list', '21,21'], ['--flash-min-overlap', '0']]:
+            result = self.invoke(['-r', self.first, '-o', self.root / ('bad-' + options[0][2:])] + options, check=False)
+            self.assertNotEqual(result.returncode, 0)
+        legacy = self.root / 'legacy'
+        legacy.mkdir()
+        (legacy / 'options.json').write_text('{}')
+        result = self.invoke(['--continue', '-o', legacy], check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Legacy Python checkpoints', result.stderr)

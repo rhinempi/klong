@@ -7,24 +7,28 @@ import sys
 
 def build_pigz(source, build_dir, cmake='cmake', compiler=None,
                zlib_include=None, zlib_library=None, static=False):
-    build_dir = Path(build_dir)
+    source = Path(source).resolve()
+    build_dir = Path(build_dir).resolve()
+    if os.path.dirname(cmake):
+        cmake = str(Path(cmake).resolve())
     binary = build_dir / ('pigz.exe' if os.name == 'nt' else 'pigz')
     try:
         build_dir.mkdir(parents=True, exist_ok=True)
         # A failed rebuild must not package an older executable left behind.
         if binary.exists():
             binary.unlink()
-        configure = [cmake, '-S', str(source), '-B', str(build_dir),
+        # Positional source + cwd works before CMake 3.13, unlike -S/-B.
+        configure = [cmake, str(source),
                      '-DCMAKE_BUILD_TYPE=Release', '-DSTATIC_BUILD=' + ('ON' if static else 'OFF')]
         for name, value in [('CMAKE_C_COMPILER', compiler), ('ZLIB_INCLUDE_DIR', zlib_include),
                             ('ZLIB_LIBRARY', zlib_library)]:
             if value:
                 configure.append('-D{}={}'.format(name, value))
-        commands = [configure, [cmake, '--build', str(build_dir), '--config', 'Release',
+        commands = [configure, [cmake, '--build', '.', '--config', 'Release',
                                 '--target', 'pigz']]
         for command in commands:
             subprocess.run(command, check=True, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, timeout=180)
+                           stderr=subprocess.STDOUT, timeout=180, cwd=str(build_dir))
         subprocess.run([str(binary), '--version'], check=True, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, timeout=10)
         print('Bundled pigz built: {}'.format(binary))

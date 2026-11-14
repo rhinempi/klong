@@ -8,6 +8,11 @@ MEGAHIT
 
 MEGAHIT is an ultra-fast and memory-efficient NGS assembler. It is optimized for metagenomes, but also works well on generic single genome assembly (small or mammalian size) and single-cell assembly.
 
+This fork builds a **native single-file `megahit` executable** with a C++ workflow
+driver and linked assembly core. Python is not required to build or run it.
+See [native executable details](docs/native-executable.md) for dependencies,
+compression, checkpoints, and migration from the historical Python driver.
+
 Installation
 ---------------
 
@@ -42,31 +47,35 @@ docker run -v $(pwd):/workspace -w /workspace --user $(id -u):$(id -g) vout/mega
 
 #### Prerequisites
 
--   For building: zlib development headers, CMake &gt;= 3.13, C/C++ compilers with OpenMP, and Python 3.
--   For running: Python 3, gzip, and bzip2. FLASH, Minimap2, and optional pigz are bundled.
+-   For building: zlib and bzip2 development headers, CMake &gt;= 3.5, and C/C++11 compilers with OpenMP.
+-   For running: standard OS shared libraries (C/C++ runtime, OpenMP, zlib, bzip2). FLASH, Minimap2, and optional pigz are bundled. Python is only needed for the optional regression-test harness.
 
 On Ubuntu/Debian, install the prerequisites with:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y git build-essential cmake python3 zlib1g-dev gzip bzip2
+sudo apt-get install -y git build-essential cmake zlib1g-dev libbz2-dev
 ```
 
 ```sh
 git clone --branch master https://github.com/rhinempi/klong.git
 cd klong
 git log -1 --oneline
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j 4
-./build/megahit --version
+mkdir -p build
+cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . -- -j4
+./megahit --version
 # Optional toy-data validation:
-cmake --build build --target simple_test
+cmake --build . --target simple_test
 # Optional installation to a user-owned directory:
-# cmake --install build --prefix "$HOME/.local"
+# Add -DCMAKE_INSTALL_PREFIX="$HOME/.local" to the configure command, then:
+# cmake --build . --target install
 ```
 
 The executable is `build/megahit`. Pigz is compiled and embedded by default;
-if its optional build fails, the executable still builds and uses Python gzip.
+if its optional build fails, the executable still builds and uses native zlib gzip.
+The build commands above and pigz helper also work with CMake older than 3.13.
 No submodule initialization or separate FLASH, Minimap2, or pigz installation is needed.
 
 Usage
@@ -77,12 +86,12 @@ Usage
 megahit -1 pe_1.fq -2 pe_2.fq -o out  # 1 paired-end library
 megahit --12 interleaved.fq -o out # one paired & interleaved paired-end library
 megahit -1 a1.fq,b1.fq,c1.fq -2 a2.fq,b2.fq,c2.fq -r se1.fq,se2.fq -o out # 3 paired-end libraries + 2 SE libraries
-megahit_core contig2fastg 119 out/intermediate_contigs/k119.contig.fa > k119.fastg # get FASTG from the intermediate contigs of k=119
+megahit contig2fastg 119 out/intermediate_contigs/flanking/k119.contigs.fa > k119.fastg
 ```
 The contigs can be found `final.contigs.fa` in the output directory.
 
 ### Advanced usage
-- Merged FASTA compression uses bundled pigz with `-t` compression threads and gzip level 1. Pigz source is vendored in `src/pigz` and built/embedded automatically; no system installation is needed. If its optional build fails, or `-DBUNDLED_PIGZ=OFF` is set, MEGAHIT still builds and uses Python gzip. `-t 1` also uses Python gzip. System PATH is not searched. FASTA formatting streams without an uncompressed intermediate file; backend, thread count, and conversion time are logged. See [pigz build details](src/pigz/INTEGRATION.md).
+- Merged FASTA compression uses bundled C pigz with `-t` compression threads and gzip level 1. Pigz source is vendored in `src/pigz` and built/embedded automatically; no system installation is needed. If its optional build fails, or `-DBUNDLED_PIGZ=OFF` is set, MEGAHIT still builds and uses native C zlib gzip. `-t 1` also uses zlib. System PATH is not searched. FASTA formatting streams without an uncompressed intermediate file; backend, thread count, and conversion time are logged. See [pigz build details](src/pigz/INTEGRATION.md).
 - Reduction-stage contig-edge merging uses a query-first exact lookup: only contig-end keys and matching longer edges are retained. Up to 32-base overlap keys fit in one `uint64_t`; larger overlaps use multiword packed keys. Contigs use the project's two-bit `CompactVector`, and extension windows are generated from packed views without constructing extended DNA strings. The input scan uses up to `min(-t, input shard count)` OpenMP workers; each output stream has one worker owner. Matches are combined in original input order, and extension deduplication/emission remains serial. Bloom filters, multiplicities, orientations, and edge emission order are unchanged. Native diagnostic mode retains a serial scan for order-dependent duplicate statistics.
 - String k-mer/edge reports are disabled in the launcher, including resumed runs. Binary `.edges.*` shards and required `.edges.info` metadata are retained. Reduction does not allocate its diagnostic origin hash map, decode longer edges for provenance, or collect report buffers/counters. Native debugging remains opt-in with `prefixbf --human_readable 1` or `MEGAHIT_HUMAN_READABLE_OUTPUT=1` for core edge writers.
 - `--merge-pairs`: export overlapping paired FASTQ reads with bundled [FLASH](https://github.com/ebiggers/flash) to `OUT_DIR/tmp/flash/library.N.merged.fa.gz`. Original reads and `reads.lib.bin` construction are unchanged; merged reads supply the consensus local contigs used in subsequent graph construction. Supports `-1`/`-2`, `--12`, gzip, and bzip2 inputs. FASTA pairs are not supported in this mode. See [integration details](src/flash/INTEGRATION.md) for merge parameters.

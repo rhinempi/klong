@@ -10,19 +10,25 @@ permissive zlib-style license in the headers of pigz.c, yarn.c, and try.c.
 Only the standard compression implementation is built (`NOZOPFLI`); optional
 level-11 Zopfli sources are not required for the workflow's level-1 gzip.
 
-With `BUNDLED_PIGZ=ON` (default), packaging builds pigz in an isolated CMake
-sub-build and embeds the executable alongside the MEGAHIT core. No download,
+With `BUNDLED_PIGZ=ON` (default), the native build compiles pigz in an isolated CMake
+sub-build and embeds its executable as bytes in the compiled MEGAHIT ELF. The
+assembly core is linked directly, not extracted. No download,
 system installation, administrator privileges, or system pigz are required.
 The sub-build uses the main C compiler and zlib paths. `STATIC_BUILD=ON` is
 also forwarded. Its source is vendored so normal builds work offline.
+Configuration uses an absolute positional source path from inside the build
+directory, supporting CMake 3.5+ without the newer `-S`/`-B` options.
 
 Compiler, linker, or configuration failure emits a warning but does not fail
-MEGAHIT packaging. A stale executable is discarded before trying the build.
-The resulting package then uses Python gzip, even if PATH contains pigz.
+MEGAHIT compilation. A stale executable is discarded before trying the build.
+The resulting executable then uses native C zlib gzip, even if PATH contains pigz.
 Use `-DBUNDLED_PIGZ=OFF` to deliberately omit the optional compressor.
 
-The self-contained executable extracts the bundled pigz next to its core in
-the runtime cache. For `-t > 1`, FASTA compression selects only that bundled
-executable. For `-t 1`, or when the bundle is absent/unavailable, Python gzip
+The native executable extracts bundled pigz to an owned temporary directory,
+removed on normal completion or handled failure. For `-t > 1`, FASTA compression
+selects only that bundled executable. For `-t 1`, or when the bundle is absent/unavailable, zlib gzip
 is used. System PATH is not searched. A runtime compression error remains an
 error, not a silent fallback; partial output is removed and not published.
+
+Production builds use `cmake/embed_native_pigz.cmake`, not Python. The older
+Python packaging helpers remain only for historical regression tests.

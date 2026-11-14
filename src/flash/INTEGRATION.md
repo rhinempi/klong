@@ -29,9 +29,9 @@ Conversion streams validated FASTA records to bundled `pigz -1 -c -n -p NUM_THRE
 when the optional compressor was built and `-t` is greater than one. Compression is parallel;
 FASTQ parsing/FASTA formatting remains a single streaming producer, with
 buffered writes and no intermediate uncompressed FASTA. Without pigz, or
-with `-t 1`, buffered Python gzip at level 1 is used. Pigz source is vendored in
+with `-t 1`, native C zlib gzip at level 1 is used. Pigz source is vendored in
 `src/pigz` and built/embedded by default. If that optional build fails, MEGAHIT
-still builds and uses Python gzip; system pigz is not required or searched.
+still builds and uses zlib gzip; system pigz is not required or searched.
 Use `-DBUNDLED_PIGZ=OFF` to omit it. See [build details](../pigz/INTEGRATION.md).
 Both paths preserve identical decompressed
 sequence content; gzip bytes and file sizes may differ. Compressor selection,

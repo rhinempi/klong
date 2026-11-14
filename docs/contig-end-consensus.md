@@ -1,5 +1,10 @@
 # Contig-End Mapping and Consensus
 
+The production workflow is now native C++ and does not require Python. See
+[native executable and resume details](native-executable.md). The historical
+Python driver remains in the source tree only for regression comparison;
+its numbered checkpoints cannot be resumed by the native driver.
+
 After the reduction/merge pass ends at k59, consensus local contigs from k59
 and the full k59 contigs, bubbles, and additional contigs seed a fresh k21
 SdBG. This seed graph does not reuse first-pass read-count edges. The flanking
