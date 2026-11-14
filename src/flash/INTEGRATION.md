@@ -25,9 +25,19 @@ with multiple threads output order may vary, but mates remain associated.
 
 Each paired library produces `OUT_DIR/tmp/flash/library.N.merged.fa.gz`,
 containing only successfully merged sequences in gzip-compressed FASTA.
-Conversion uses buffered writes and gzip level 1 to avoid the expensive
-single-threaded level-9 compression default. Sequence content is unchanged;
-the compressed file is larger. Conversion start and elapsed time are logged.
+Conversion streams validated FASTA records to bundled `pigz -1 -c -n -p NUM_THREADS`
+when the optional compressor was built and `-t` is greater than one. Compression is parallel;
+FASTQ parsing/FASTA formatting remains a single streaming producer, with
+buffered writes and no intermediate uncompressed FASTA. Without pigz, or
+with `-t 1`, buffered Python gzip at level 1 is used. Pigz source is vendored in
+`src/pigz` and built/embedded by default. If that optional build fails, MEGAHIT
+still builds and uses Python gzip; system pigz is not required or searched.
+Use `-DBUNDLED_PIGZ=OFF` to omit it. See [build details](../pigz/INTEGRATION.md).
+Both paths preserve identical decompressed
+sequence content; gzip bytes and file sizes may differ. Compressor selection,
+thread count, and conversion elapsed time are logged. A failed compressor is
+reaped and its partial output removed; the export and completion manifest
+are published only after successful conversion.
 Libraries are numbered from zero, with separate-file pairs first, followed
 by interleaved inputs. A library with no mergeable pairs produces a valid
 empty gzip file. Single-end inputs are not included in the merged export.

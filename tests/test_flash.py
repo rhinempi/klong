@@ -4,9 +4,11 @@ import bz2
 import gzip
 import importlib.machinery
 import importlib.util
+import io
 import os
 from pathlib import Path
 import random
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -204,6 +206,27 @@ class FlashIntegrationTest(unittest.TestCase):
         self.assertEqual(self.opt.se, [str(self.single)])
         self.assertEqual([sequences(self.merged_path(i)) for i in range(2)], [[self.fragment]] * 2)
 
+    def test_workflow_forwards_compression_thread_count(self):
+        self.paired_inputs()
+        self.opt.num_cpu_threads = 2
+        with mock.patch.object(self.launcher, 'fastq_to_fasta_gz',
+                               wraps=self.launcher.fastq_to_fasta_gz) as convert:
+            self.launcher.merge_paired_reads()
+        self.assertEqual(convert.call_args.kwargs['num_threads'], 2)
+        self.assertEqual(sequences(self.merged_path()), [self.fragment])
+
+    def test_compression_failure_does_not_publish_export_or_manifest(self):
+        self.paired_inputs()
+        def fail(source, output, **kwargs):
+            Path(output).write_bytes(b'partial gzip')
+            raise self.launcher.Usage('compression failed')
+        with mock.patch.object(self.launcher, 'fastq_to_fasta_gz', side_effect=fail):
+            with self.assertRaises(self.launcher.Usage):
+                self.launcher.merge_paired_reads()
+        self.assertFalse(self.merged_path().exists())
+        self.assertFalse(Path(str(self.merged_path()) + '.tmp').exists())
+        self.assertFalse((self.directory / 'tmp/flash/merged.json').exists())
+
     def test_cleanup_preserves_merged_results(self):
         self.paired_inputs()
         self.launcher.merge_paired_reads()
@@ -225,6 +248,116 @@ class FlashIntegrationTest(unittest.TestCase):
 
 
 class FastaConversionTest(unittest.TestCase):
+    def setUp(self):
+        self.launcher = load_launcher()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.source = Path(self.temp.name) / 'merged.fastq'
+        self.output = Path(self.temp.name) / 'merged.fa.gz'
+        self.source.write_bytes(b'@read description\nACGT\n+\nIIII\n')
+
+    def test_missing_pigz_falls_back_to_python_gzip(self):
+        with mock.patch.object(self.launcher, 'find_bundled_pigz', return_value=None), \
+                mock.patch.object(self.launcher.subprocess, 'Popen') as popen:
+            self.launcher.fastq_to_fasta_gz(str(self.source), str(self.output), num_threads=4)
+        popen.assert_not_called()
+        self.assertEqual(gzip.decompress(self.output.read_bytes()), b'>read description\nACGT\n')
+
+    @unittest.skipUnless(shutil.which('pigz'), 'pigz is not installed')
+    def test_pigz_preserves_content_and_uses_requested_threads(self):
+        self.source.write_bytes(b'@read description\r\nACGT\r\n+\r\nIIII\r\n'
+                                b'@second\nGATTACA\n+\nIIIIIII\n')
+        with mock.patch.object(self.launcher, 'find_bundled_pigz', return_value=shutil.which('pigz')), \
+                mock.patch.object(self.launcher.subprocess, 'Popen',
+                               wraps=subprocess.Popen) as popen:
+            self.launcher.fastq_to_fasta_gz(str(self.source), str(self.output), num_threads=4)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index('-p') + 1], '4')
+        self.assertEqual(gzip.decompress(self.output.read_bytes()),
+                         b'>read description\nACGT\n>second\nGATTACA\n')
+        self.assertTrue(popen.call_args.kwargs['stdin'] is subprocess.PIPE)
+
+    @unittest.skipUnless(shutil.which('pigz'), 'pigz is not installed')
+    def test_pigz_handles_empty_and_rejects_truncated_input(self):
+        self.source.write_bytes(b'')
+        with mock.patch.object(self.launcher, 'find_bundled_pigz', return_value=shutil.which('pigz')):
+            self.launcher.fastq_to_fasta_gz(str(self.source), str(self.output), num_threads=2)
+            self.assertEqual(gzip.decompress(self.output.read_bytes()), b'')
+            self.source.write_bytes(b'@read\nACGT\n+\n')
+            with self.assertRaises(self.launcher.Usage):
+                self.launcher.fastq_to_fasta_gz(str(self.source), str(self.output), num_threads=2)
+        self.assertFalse(self.output.exists())
+
+    def fake_compressor(self, stream=None, return_code=2):
+        process = mock.Mock()
+        process.stdin = io.BytesIO() if stream is None else stream
+        process.wait.return_value = return_code
+        process.poll.return_value = return_code
+
+        def launch(*args, **kwargs):
+            kwargs['stderr'].write(b'compression error')
+            return process
+
+        self.launcher.find_bundled_pigz = mock.Mock(return_value='/fake/pigz')
+        self.launcher.subprocess = mock.Mock(Popen=mock.Mock(side_effect=launch), PIPE=subprocess.PIPE)
+        return process
+
+    def test_compressor_failure_is_reported_and_output_removed(self):
+        process = self.fake_compressor()
+        with self.assertRaises(self.launcher.Usage) as failure:
+            self.launcher.fastq_to_fasta_gz(str(self.source), str(self.output), num_threads=2)
+        self.assertIn('compression error', failure.exception.msg)
+        self.assertFalse(self.output.exists())
+        self.assertTrue(process.stdin.closed)
+        process.wait.assert_called()
+
+    def test_compressor_startup_failure_removes_partial_output(self):
+        self.launcher.find_bundled_pigz = mock.Mock(return_value='/missing/pigz')
+        self.launcher.subprocess = mock.Mock(Popen=mock.Mock(side_effect=OSError('cannot execute')),
+                                            PIPE=subprocess.PIPE)
+        with self.assertRaises(self.launcher.Usage) as failure:
+            self.launcher.fastq_to_fasta_gz(str(self.source), str(self.output), num_threads=2)
+        self.assertIn('Cannot start pigz', failure.exception.msg)
+        self.assertFalse(self.output.exists())
+
+    def test_broken_pipe_is_reported_and_child_reaped(self):
+        class BrokenStream(io.BytesIO):
+            def write(self, data):
+                raise BrokenPipeError('compressor stopped')
+        process = self.fake_compressor(stream=BrokenStream())
+        with self.assertRaises(self.launcher.Usage):
+            self.launcher.fastq_to_fasta_gz(str(self.source), str(self.output), num_threads=2)
+        self.assertFalse(self.output.exists())
+        process.wait.assert_called()
+
+    def test_invalid_input_kills_and_reaps_compressor(self):
+        process = self.fake_compressor(return_code=None)
+        self.source.write_bytes(b'@read\nACGT\n+\nIII\n')
+        with self.assertRaises(self.launcher.Usage):
+            self.launcher.fastq_to_fasta_gz(str(self.source), str(self.output), num_threads=2)
+        process.kill.assert_called_once()
+        process.wait.assert_called()
+        self.assertFalse(self.output.exists())
+
+    def test_only_bundled_executable_is_selected(self):
+        self.launcher.__file__ = str(Path(self.temp.name) / 'megahit')
+        pigz = Path(self.temp.name) / 'pigz'
+        self.assertIsNone(self.launcher.find_bundled_pigz())
+        pigz.write_bytes(b'placeholder')
+        pigz.chmod(0o644)
+        self.assertIsNone(self.launcher.find_bundled_pigz())
+        pigz.chmod(0o755)
+        self.assertEqual(self.launcher.find_bundled_pigz(), str(pigz))
+
+    def test_missing_bundle_ignores_system_pigz(self):
+        self.launcher.__file__ = str(Path(self.temp.name) / 'megahit')
+        with mock.patch.object(self.launcher.shutil, 'which', return_value='/usr/bin/pigz') as which, \
+                mock.patch.object(self.launcher.subprocess, 'Popen') as popen:
+            self.launcher.fastq_to_fasta_gz(str(self.source), str(self.output), num_threads=4)
+        which.assert_not_called()
+        popen.assert_not_called()
+        self.assertEqual(gzip.decompress(self.output.read_bytes()), b'>read description\nACGT\n')
+
     def test_fast_compression_preserves_headers_and_sequences(self):
         launcher = load_launcher()
         with tempfile.TemporaryDirectory() as directory:

@@ -12,6 +12,7 @@ option(COVERAGE "Generate coverage report" OFF)
 option(STATIC_BUILD "Build static executation" OFF)
 option(SANITIZER "Enable sanitizers" OFF)
 option(TSAN "Enable thread sanitizers" OFF)
+option(BUNDLED_PIGZ "Build and embed optional parallel gzip compressor" ON)
 
 include_directories(src)
 FILE(GLOB_RECURSE ASMBL_SOURCE "src/assembly/*.cpp")
@@ -110,13 +111,35 @@ endif (STATIC_BUILD)
 
 target_link_libraries(megahit_core ${ZLIB_LIBRARIES} flash minimap2)
 
+set(PIGZ_EMBED_OPTIONS)
+file(GLOB PIGZ_EMBED_DEPENDENCIES "${CMAKE_SOURCE_DIR}/src/pigz/*")
+if(BUNDLED_PIGZ)
+    list(APPEND PIGZ_EMBED_OPTIONS
+            --pigz-source ${CMAKE_SOURCE_DIR}/src/pigz
+            --pigz-build-dir ${CMAKE_CURRENT_BINARY_DIR}/optional-pigz
+            --pigz-cmake ${CMAKE_COMMAND}
+            --pigz-cc ${CMAKE_C_COMPILER})
+    if(ZLIB_INCLUDE_DIR)
+        list(APPEND PIGZ_EMBED_OPTIONS --pigz-zlib-include ${ZLIB_INCLUDE_DIR})
+    endif()
+    if(ZLIB_LIBRARY)
+        list(APPEND PIGZ_EMBED_OPTIONS --pigz-zlib-library ${ZLIB_LIBRARY})
+    endif()
+    if(STATIC_BUILD)
+        list(APPEND PIGZ_EMBED_OPTIONS --pigz-static)
+    endif()
+endif()
+
 add_custom_command(
         OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/megahit
         COMMAND python3 ${CMAKE_SOURCE_DIR}/cmake/embed_megahit.py
                 --launcher ${CMAKE_SOURCE_DIR}/src/megahit
                 --core $<TARGET_FILE:megahit_core>
                 --output ${CMAKE_CURRENT_BINARY_DIR}/megahit
+                ${PIGZ_EMBED_OPTIONS}
         DEPENDS megahit_core ${CMAKE_SOURCE_DIR}/src/megahit ${CMAKE_SOURCE_DIR}/cmake/embed_megahit.py
+                ${CMAKE_SOURCE_DIR}/cmake/build_optional_pigz.py ${PIGZ_EMBED_DEPENDENCIES}
+                ${CMAKE_CURRENT_BINARY_DIR}/CMakeCache.txt
         VERBATIM)
 
 add_custom_target(embedded_megahit ALL
@@ -168,6 +191,10 @@ add_custom_target(query_merge_test
                 "MEGAHIT_TEST_CORE=$<TARGET_FILE:megahit_core>"
                 python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_query_merge.py
         DEPENDS megahit_core
+        VERBATIM)
+
+add_custom_target(pigz_test
+        COMMAND python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_pigz_build.py
         VERBATIM)
 
 install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/megahit DESTINATION bin)

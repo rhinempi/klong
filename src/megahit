@@ -925,7 +925,7 @@ def merge_paired_reads():
             conversion_start = time.monotonic()
             try:
                 fastq_to_fasta_gz(os.path.join(work_dir, prefix + '.extendedFrags.fastq'),
-                                  output + '.tmp')
+                                  output + '.tmp', num_threads=opt.num_cpu_threads)
                 os.replace(output + '.tmp', output)
             finally:
                 remove_if_exists(output + '.tmp')
@@ -937,11 +937,9 @@ def merge_paired_reads():
     os.replace(manifest + '.tmp', manifest)
 
 
-def fastq_to_fasta_gz(source_path, output_path):
+def write_fastq_as_fasta(source_path, dest):
     # FLASH emits normalized four-line FASTQ records, even for multiline inputs.
-    with open(source_path, 'rb') as source, \
-            gzip.open(output_path, 'wb', compresslevel=1) as compressed, \
-            io.BufferedWriter(compressed, buffer_size=1024 * 1024) as dest:
+    with open(source_path, 'rb') as source:
         while True:
             header = source.readline()
             if not header:
@@ -949,9 +947,58 @@ def fastq_to_fasta_gz(source_path, output_path):
             sequence = source.readline().rstrip(b'\r\n')
             separator = source.readline()
             quality = source.readline().rstrip(b'\r\n')
-            if not header.startswith(b'@') or not separator.startswith(b'+') or len(sequence) != len(quality):
+            if (not header.startswith(b'@') or not separator.startswith(b'+')
+                    or len(sequence) != len(quality) or not quality):
                 raise Usage('Invalid merged FASTQ output from FLASH: ' + source_path)
             dest.write(b'>' + header[1:].rstrip(b'\r\n') + b'\n' + sequence + b'\n')
+
+
+def find_bundled_pigz():
+    candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pigz')
+    return candidate if os.path.isfile(candidate) and os.access(candidate, os.X_OK) else None
+
+
+def fastq_to_fasta_gz(source_path, output_path, num_threads=1):
+    num_threads = max(1, num_threads)
+    pigz = find_bundled_pigz() if num_threads > 1 else None
+    try:
+        if pigz is None:
+            if num_threads > 1:
+                logger.warning('Bundled pigz unavailable; use single-threaded Python gzip for merged FASTA')
+            logger.info('Merged FASTA compressor: Python gzip, 1 thread')
+            with gzip.open(output_path, 'wb', compresslevel=1) as compressed, \
+                    io.BufferedWriter(compressed, buffer_size=1024 * 1024) as dest:
+                write_fastq_as_fasta(source_path, dest)
+            return
+
+        logger.info('Merged FASTA compressor: bundled pigz, %d compression threads', num_threads)
+        # File-backed stderr avoids pipe deadlock while streaming FASTA to stdin.
+        with open(output_path, 'wb') as output, tempfile.TemporaryFile() as errors:
+            try:
+                process = subprocess.Popen([pigz, '-1', '-c', '-n', '-p', str(num_threads)],
+                                           stdin=subprocess.PIPE, stdout=output, stderr=errors)
+            except OSError as error:
+                raise Usage('Cannot start pigz: {}'.format(error)) from error
+            try:
+                pipe_failed = False
+                try:
+                    with io.BufferedWriter(process.stdin, buffer_size=1024 * 1024) as dest:
+                        write_fastq_as_fasta(source_path, dest)
+                except BrokenPipeError:
+                    pipe_failed = True
+                return_code = process.wait()
+                if return_code != 0 or pipe_failed:
+                    errors.seek(0)
+                    message = errors.read().decode('utf-8', errors='replace').strip()
+                    raise Usage('pigz compression failed (exit {}): {}'.format(return_code, message))
+            except BaseException:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+                raise
+    except BaseException:
+        remove_if_exists(output_path)
+        raise
 
 
 def file_signature(path):
