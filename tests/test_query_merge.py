@@ -1,5 +1,6 @@
 """Packed query-first merge against an independent sequence oracle."""
 import os
+import json
 from pathlib import Path
 import random
 import struct
@@ -78,7 +79,8 @@ def oracle(shards, contigs, long_contigs, overlap, length, threads):
 
 @unittest.skipUnless(CORE, 'set MEGAHIT_TEST_CORE to the newly built core')
 class QueryMergeTest(unittest.TestCase):
-    def check_merge(self, overlap, k, shards, contigs, long_contigs, threads=3, reports=False):
+    def check_merge(self, overlap, k, shards, contigs, long_contigs, threads=3, reports=False,
+                    benchmark=False):
         with tempfile.TemporaryDirectory(prefix='megahit-query-merge-') as directory:
             root = Path(directory)
             prefix = root / 'input'
@@ -99,22 +101,41 @@ class QueryMergeTest(unittest.TestCase):
                        '--contig', str(root / 'short.fa'), '--long_contig', str(root / 'long.fa'),
                        '--num_cpu_threads', str(threads), '--max_bloom_gb', '0.01',
                        '--human_readable', '1' if reports else '0']
-            output = root / 'new'
-            subprocess.run([CORE] + command + ['--output_prefix', str(output)],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
             expected = oracle(shards, contigs, long_contigs, overlap, length, threads)
-            for i, data in enumerate(expected):
-                self.assertEqual(Path(str(output) + '.edges.' + str(i)).read_bytes(), data)
+            benchmark_counts = None
             if BASELINE:
                 baseline = root / 'old'
                 subprocess.run([BASELINE] + command + ['--output_prefix', str(baseline)],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-                for suffix in ['.edges.info'] + ['.edges.' + str(i) for i in range(threads)]:
-                    self.assertEqual(Path(str(output) + suffix).read_bytes(),
-                                     Path(str(baseline) + suffix).read_bytes())
-                if reports:
-                    self.assertEqual(Path(str(output) + '.contig_edges.txt').read_bytes(),
-                                     Path(str(baseline) + '.contig_edges.txt').read_bytes())
+            for backend in ('fm', 'hash'):
+                output = root / ('new-' + backend)
+                result = subprocess.run([CORE] + command + ['--output_prefix', str(output),
+                                         '--merge_index', backend, '--merge_dedup',
+                                         'bloom' if reports else 'sort'], stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, check=True, text=True)
+                self.assertIn('Merge index: ' + backend, result.stderr)
+                if benchmark:
+                    bench = list(command)
+                    bench[bench.index('merge')] = 'index-bench'
+                    measured = subprocess.run([CORE] + bench + ['--merge_index', backend],
+                                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                              text=True, check=True)
+                    counts = json.loads(measured.stdout)
+                    for field in ('backend', 'threads', 'build_seconds', 'lookup_seconds', 'fm_bytes'):
+                        counts.pop(field)
+                    self.assertEqual(counts['records'], sum(map(len, shards)))
+                    if benchmark_counts is not None:
+                        self.assertEqual(counts, benchmark_counts)
+                    benchmark_counts = counts
+                for i, data in enumerate(expected):
+                    self.assertEqual(Path(str(output) + '.edges.' + str(i)).read_bytes(), data)
+                if BASELINE:
+                    for suffix in ['.edges.info'] + ['.edges.' + str(i) for i in range(threads)]:
+                        self.assertEqual(Path(str(output) + suffix).read_bytes(),
+                                         Path(str(baseline) + suffix).read_bytes())
+                    if reports:
+                        self.assertEqual(Path(str(output) + '.contig_edges.txt').read_bytes(),
+                                         Path(str(baseline) + '.contig_edges.txt').read_bytes())
 
     def test_word_boundaries_and_maximum_k(self):
         for overlap, k in [(3, 5), (21, 29), (21, 31), (31, 32), (32, 39), (33, 39),
@@ -162,3 +183,23 @@ class QueryMergeTest(unittest.TestCase):
                 with self.subTest(overlap=overlap, threads=threads):
                     self.check_merge(overlap, k, shards, [seq[::-1] for seq in desired],
                                      [dna(4 * (k + 1)), 'A' * (k + 10)], threads=threads)
+
+    def test_large_dictionary_and_seed_collisions(self):
+        rng = random.Random(925)
+        dna = lambda n: ''.join(rng.choice('ACGT') for _ in range(n))
+        edges = [canonical(dna(30)) for _ in range(150)]
+        desired = [edge[-21:] + dna(5) for edge in edges[:80]]
+        desired += [dna(5) + edge[:21] for edge in edges[80:]]
+        desired += [dna(21) + 'ACGTACGT' for _ in range(6000)]
+        desired += ['A' * 21 + dna(5)] * 100
+        self.check_merge(21, 29, [[(seq, 3) for seq in edges[:75]],
+                                  [(seq, 9) for seq in edges[75:]]],
+                         [seq[::-1] for seq in desired], [], threads=4, benchmark=True)
+
+    def test_single_large_shard_parallel_search_preserves_order(self):
+        rng = random.Random(3932)
+        dna = lambda n: ''.join(rng.choice('ACGT') for _ in range(n))
+        edge = canonical(dna(30))
+        records = [(edge, i % 100 + 1) for i in range(100003)]
+        contig = edge[-21:] + dna(3)
+        self.check_merge(21, 29, [records], [contig[::-1]], [], threads=4)

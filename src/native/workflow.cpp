@@ -51,6 +51,9 @@ int cpu_count() {
 }
 struct Options {
   std::string out_dir, temp_dir, out_prefix, presets;
+  std::string merge_index = "hash";
+  std::string merge_dedup = "sort";
+  double merge_sort_memory = 128;
   double memory = 0.9, merge_similar = 0.95, prune_depth = 2,
          disconnect_ratio = 0.1, low_local_ratio = 0.2, flash_max_mismatch_density = 0.25;
   int min_contig_len = 200, k_min = 21, k_max = 141, k_step = 10, min_count = 2,
@@ -63,7 +66,8 @@ struct Options {
        debug_assembly = false, merge_pairs = false, verbose = false, hw_accel = true;
   std::vector<int> k_list{21, 29, 39, 59, 79, 99, 119, 141};
   Args pe1, pe2, pe12, se;
-  NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(Options, out_dir, temp_dir, out_prefix, presets,
+  NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(Options, out_dir, temp_dir, out_prefix, presets, merge_index,
+      merge_dedup, merge_sort_memory,
       memory, merge_similar, prune_depth, disconnect_ratio, low_local_ratio,
       flash_max_mismatch_density, min_contig_len, k_min, k_max, k_step, min_count,
       max_tip_len, bubble_level, merge_len, prune_level, num_cpu_threads, cleaning_rounds,
@@ -88,6 +92,9 @@ Assembly:
   --k-list LIST                [21,29,39,59,79,99,119,141]
   --k-min N --k-max N --k-step N  Override k-list; odd k, even step <=28
   --min-count N                Minimum edge multiplicity [2]
+  --merge-index fm|hash        Exact contig-end overlap index [hash]
+  --merge-dedup bloom|sort     Merge candidate redundancy filter [sort]
+  --merge-sort-memory X       Sort record buffers in MiB [128]
   --min-contig-len N           Final minimum contig length [200]
   --no-mercy --no-local --kmin-1pass --no-hw-accel
   --bubble-level N             Bubble cleaning intensity [2]
@@ -139,6 +146,19 @@ Options parse(int argc, char **argv) {
     else if (key == "--tmp-dir") opt.temp_dir = absolute(value());
     else if (key == "--out-prefix") opt.out_prefix = value();
     else if (key == "--presets") opt.presets = value();
+    else if (key == "--merge-index") {
+      opt.merge_index = value();
+      if (opt.merge_index != "fm" && opt.merge_index != "hash") throw Error("--merge-index must be fm or hash");
+    }
+    else if (key == "--merge-dedup") {
+      opt.merge_dedup = value();
+      if (opt.merge_dedup != "bloom" && opt.merge_dedup != "sort") throw Error("--merge-dedup must be bloom or sort");
+    }
+    else if (key == "--merge-sort-memory") {
+      opt.merge_sort_memory = real(value());
+      if (opt.merge_sort_memory < 0.0625 || opt.merge_sort_memory > 1048576)
+        throw Error("--merge-sort-memory must be between 0.0625 and 1048576 MiB");
+    }
     else if (key == "-t" || key == "--num-cpu-threads") opt.num_cpu_threads = integer(value());
     else if (key == "-m" || key == "--memory") opt.memory = real(value());
     else if (key == "--min-contig-len") opt.min_contig_len = integer(value());
@@ -347,6 +367,8 @@ class Driver {
         throw Error("Legacy Python checkpoints cannot be resumed by the native driver; use a fresh output directory");
       std::string output = opt.out_dir;
       opt = saved.get<Options>(); opt.out_dir = output; opt.continue_mode = true;
+      // Native runs predating this option used Bloom deduplication.
+      if (!saved.contains("merge_dedup")) opt.merge_dedup = "bloom";
       if (exists(checkpoints())) completed = read_json(checkpoints());
     } else {
       if (exists(opt.out_dir) && !opt.force_overwrite) throw Error("Output directory already exists: " + opt.out_dir);
@@ -564,8 +586,10 @@ class Driver {
             "--contig", prefix + ".lt_k" + number(to) + "_plus1.contigs.fa",
             "--long_contig", prefix + ".ge_k" + number(to) + "_plus1.contigs.fa",
             "--short_k", number(from), "--long_k", number(to), "--num_cpu_threads",
-            number(opt.num_cpu_threads), "--human_readable", "0"},
-           "Merge k = " + number(from) + " assembly edges into k = " + number(to));
+            number(opt.num_cpu_threads), "--human_readable", "0", "--merge_index", opt.merge_index,
+            "--merge_dedup", opt.merge_dedup, "--sort_memory_mb", number(opt.merge_sort_memory),
+            "--host_mem", number(host_mem)},
+           "Merge k = " + number(from) + " assembly edges into k = " + number(to), true);
     });
   }
   void assemble(int k, const std::string &input, int next = 0) {

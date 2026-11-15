@@ -11,6 +11,7 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,6 +21,8 @@
 #include "utils/utils.h"
 #include "sequence/io/edge/edge_io_meta.h"
 #include "utils/options_description.h"
+#include "end_fm_index.h"
+#include "exact_merge_dedup.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -48,6 +51,9 @@ struct Options {
   double host_mem{0};
   double reduce_fpr{1e-15};
   int human_readable{0};
+  std::string merge_index{"hash"};
+  std::string merge_dedup{"sort"};
+  double sort_memory_mb{128};
 };
 
 struct KmerKey {
@@ -148,33 +154,45 @@ KmerKey PackedReverseComplement(const KmerKey &key, unsigned length) {
 
 class MergeQueryIndex {
  public:
-  explicit MergeQueryIndex(unsigned length) : compact_(length <= 32) {}
+  MergeQueryIndex(unsigned length, const std::string &backend)
+      : compact_(length <= 32), use_fm_(backend == "fm"), fm_(length) {}
 
   void Register(const KmerKey &key) {
-    if (compact_) small_.emplace(key.words[0], std::vector<KmerKey>{});
-    else large_.emplace(key, std::vector<KmerKey>{});
+    if (use_fm_) { fm_.Add(key.words); return; }
+    bool added = compact_ ? small_.emplace(key.words[0], hits_.size()).second
+                          : large_.emplace(key, hits_.size()).second;
+    if (added) hits_.emplace_back();
+  }
+
+  void Build(int threads) {
+    if (use_fm_) { fm_.Build(threads); hits_.resize(fm_.size()); }
+  }
+
+  size_t FindId(const KmerKey &key) const {
+    if (use_fm_) return fm_.Find(key.words);
+    if (compact_) {
+      auto it = small_.find(key.words[0]);
+      return it == small_.end() ? EndFmIndex::Missing() : it->second;
+    }
+    auto it = large_.find(key);
+    return it == large_.end() ? EndFmIndex::Missing() : it->second;
   }
 
   std::vector<KmerKey> *Find(const KmerKey &key) {
-    if (compact_) {
-      auto it = small_.find(key.words[0]);
-      return it == small_.end() ? nullptr : &it->second;
-    }
-    auto it = large_.find(key);
-    return it == large_.end() ? nullptr : &it->second;
+    size_t id = FindId(key);
+    return id == EndFmIndex::Missing() ? nullptr : &hits_[id];
   }
 
-  bool Has(const KmerKey &key) const {
-    return compact_ ? small_.find(key.words[0]) != small_.end()
-                    : large_.find(key) != large_.end();
-  }
-
-  size_t size() const { return compact_ ? small_.size() : large_.size(); }
+  std::vector<KmerKey> &Hits(size_t id) { return hits_[id]; }
+  size_t size() const { return hits_.size(); }
+  size_t fm_bytes() const { return use_fm_ ? fm_.bytes() : 0; }
 
  private:
-  bool compact_;
-  std::unordered_map<uint64_t, std::vector<KmerKey>> small_;
-  std::unordered_map<KmerKey, std::vector<KmerKey>, KmerKeyHash> large_;
+  bool compact_, use_fm_;
+  EndFmIndex fm_;
+  std::vector<std::vector<KmerKey>> hits_;
+  std::unordered_map<uint64_t, size_t> small_;
+  std::unordered_map<KmerKey, size_t, KmerKeyHash> large_;
 };
 
 struct PackedMergeContig {
@@ -680,7 +698,7 @@ bool ReadNextFasta(std::ifstream *in, std::string *name, std::string *seq) {
 Options ParseOptions(int argc, char **argv) {
   Options opt;
   OptionsDescription desc;
-  desc.AddOption("mode", "M", opt.mode, "reduce or merge");
+  desc.AddOption("mode", "M", opt.mode, "reduce, merge, or index-bench");
   desc.AddOption("short_prefix", "s", opt.short_prefix, "prefix of shorter k binary edge files");
   desc.AddOption("long_prefix", "l", opt.long_prefix, "prefix of longer/current k binary edge files");
   desc.AddOption("output_prefix", "o", opt.output_prefix, "output prefix for edge files");
@@ -695,15 +713,26 @@ Options ParseOptions(int argc, char **argv) {
   desc.AddOption("host_mem", "", opt.host_mem, "total memory budget in bytes (0: available memory)");
   desc.AddOption("reduce_fpr", "", opt.reduce_fpr, "target estimated false-positive rate for reduction");
   desc.AddOption("human_readable", "", opt.human_readable, "write human-readable debug reports");
+  desc.AddOption("merge_index", "", opt.merge_index, "exact contig-end index: fm or hash");
+  desc.AddOption("merge_dedup", "", opt.merge_dedup, "merge redundancy filter: bloom or sort");
+  desc.AddOption("sort_memory_mb", "", opt.sort_memory_mb, "exact-sort record buffer budget in MiB");
   desc.Parse(argc, argv);
 
-  if (opt.long_prefix.empty() || opt.output_prefix.empty() || opt.long_k == 0 ||
-      (opt.mode == "reduce" && (opt.short_prefix.empty() || opt.short_k == 0))) {
+  if (opt.long_prefix.empty() || (opt.mode != "index-bench" && opt.output_prefix.empty()) || opt.long_k == 0 ||
+      (opt.mode == "reduce" && (opt.short_prefix.empty() || opt.short_k == 0)) ||
+      (opt.mode == "index-bench" && opt.short_k == 0)) {
     std::cerr << "Usage: " << argv[0] << " " << std::string(desc) << std::endl;
     std::exit(1);
   }
   if (opt.num_threads <= 0) opt.num_threads = 1;
   if (opt.max_hashes <= 0) opt.max_hashes = 1;
+  if (opt.merge_index != "fm" && opt.merge_index != "hash")
+    xfatal("Unknown merge index; choose fm or hash\n");
+  if ((opt.merge_dedup != "bloom" && opt.merge_dedup != "sort") ||
+      !std::isfinite(opt.sort_memory_mb) || opt.sort_memory_mb < 0.0625 || opt.sort_memory_mb > 1048576)
+    xfatal("Invalid merge dedup backend or sort memory (minimum 0.0625 MiB)\n");
+  if (opt.mode == "merge" && opt.merge_dedup == "sort" && opt.human_readable)
+    xfatal("Exact sort currently requires --human_readable 0; per-candidate provenance reports are not supported\n");
   if (!std::isfinite(opt.max_bloom_gb) || opt.max_bloom_gb < 0 || opt.max_bloom_gb > 1048576 ||
       !std::isfinite(opt.reserve_gb) || opt.reserve_gb < 0 || opt.reserve_gb > 1048576 ||
       !std::isfinite(opt.host_mem) || opt.host_mem < 0 || opt.host_mem >= 9e18 ||
@@ -908,7 +937,68 @@ int RunReduce(const Options &opt) {
   return 0;
 }
 
+int RunIndexBenchmark(const Options &opt) {
+  using Clock = std::chrono::steady_clock;
+  auto started = Clock::now();
+  EdgeIoMetadata meta = LoadMetadata(opt.long_prefix);
+  unsigned edge_len = EdgeLength(meta);
+  if (meta.kmer_size != opt.long_k || opt.short_k >= edge_len)
+    xfatal("Invalid k sizes for index benchmark\n");
+  MergeQueryIndex prefixes(opt.short_k, opt.merge_index), suffixes(opt.short_k, opt.merge_index);
+  std::ifstream contigs(opt.contig_file);
+  if (!contigs) xfatal("Cannot read contig-end benchmark input\n");
+  std::string name, seq;
+  while (ReadNextFasta(&contigs, &name, &seq)) {
+    if (seq.size() < opt.short_k) continue;
+    PackedMergeContig contig(seq, name, false);
+    KmerKey prefix, suffix;
+    if (!contig.EndKey(0, opt.short_k, &prefix) ||
+        !contig.EndKey(seq.size() - opt.short_k, opt.short_k, &suffix)) continue;
+    suffixes.Register(prefix); prefixes.Register(suffix);
+  }
+  prefixes.Build(opt.num_threads); suffixes.Build(opt.num_threads);
+  auto indexed = Clock::now();
+  struct Counts { uint64_t records = 0, orientations = 0, prefix = 0, suffix = 0; };
+  auto ranges = ReductionRanges(opt.long_prefix, meta, opt.num_threads);
+  std::vector<Counts> counts(ranges.size());
+#pragma omp parallel for schedule(dynamic, 1) num_threads(opt.num_threads)
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    const auto &range = ranges[i];
+    auto &count = counts[i];
+    auto query = [&](const KmerKey &key) {
+      ++count.orientations;
+      count.prefix += prefixes.FindId(PackedKeySlice(key, 0, opt.short_k)) != EndFmIndex::Missing();
+      count.suffix += suffixes.FindId(PackedKeySlice(key, edge_len - opt.short_k, opt.short_k)) != EndFmIndex::Missing();
+    };
+    ForEachEdgeRange(opt.long_prefix, meta, range.file_id, range.first, range.count,
+                     [&](const uint32_t *edge) {
+      ++count.records;
+      auto forward = RawKeyFromEdge(edge, 0, edge_len);
+      auto reverse = PackedReverseComplement(forward, edge_len);
+      query(forward);
+      if (!(reverse == forward)) query(reverse);
+    });
+  }
+  auto finished = Clock::now();
+  Counts total;
+  for (const auto &count : counts) {
+    total.records += count.records; total.orientations += count.orientations;
+    total.prefix += count.prefix; total.suffix += count.suffix;
+  }
+  std::cout << std::setprecision(9) << "{\"backend\":\"" << opt.merge_index
+            << "\",\"threads\":" << opt.num_threads << ",\"build_seconds\":"
+            << std::chrono::duration<double>(indexed - started).count()
+            << ",\"lookup_seconds\":" << std::chrono::duration<double>(finished - indexed).count()
+            << ",\"records\":" << total.records << ",\"orientations\":" << total.orientations
+            << ",\"prefix_hits\":" << total.prefix << ",\"suffix_hits\":" << total.suffix
+            << ",\"prefix_keys\":" << prefixes.size() << ",\"suffix_keys\":" << suffixes.size()
+            << ",\"fm_bytes\":" << prefixes.fm_bytes() + suffixes.fm_bytes() << "}\n";
+  return 0;
+}
+
 int RunMerge(const Options &opt) {
+  using Clock = std::chrono::steady_clock;
+  const auto started = Clock::now();
   EdgeIoMetadata base_meta = LoadMetadata(opt.long_prefix);
   if (base_meta.kmer_size != opt.long_k) {
     xfatal("Invalid merge k size: edge k {}, requested {}\n",
@@ -920,28 +1010,44 @@ int RunMerge(const Options &opt) {
 
   const unsigned edge_len = EdgeLength(base_meta);
   const unsigned overlap_len = opt.short_k;
+  const unsigned active_words = (edge_len + 31) / 32;
   if (overlap_len >= edge_len) {
     xfatal("Invalid overlap length {} for long edge length {}\n", overlap_len, edge_len);
   }
 
   EdgeOutputWriter writer(opt.output_prefix, opt.long_k, base_meta.words_per_edge,
                           opt.num_threads, opt.human_readable != 0);
-  uint64_t bloom_byte_cap = SelectBloomByteCap(opt);
-  uint64_t merge_bloom_bytes = std::max<uint64_t>(2ULL << 20, bloom_byte_cap / 2);
   uint64_t expected_merge_items = std::max<uint64_t>(1, TotalRecords(base_meta));
-  uint64_t read_count_target_bytes = std::max<uint64_t>(1ULL << 20, expected_merge_items * 64ULL);
-  uint64_t extension_target_bytes = std::max<uint64_t>(1ULL << 20, expected_merge_items * 64ULL);
-  uint64_t read_count_bloom_bytes = std::min(merge_bloom_bytes, read_count_target_bytes);
-  uint64_t extension_bloom_bytes = std::min(merge_bloom_bytes, extension_target_bytes);
-  BloomFilter read_count_edges(read_count_bloom_bytes * 8,
+  std::unique_ptr<BloomFilter> read_count_edges, emitted_extensions;
+  std::unique_ptr<ExactMergeDedup> exact;
+  if (opt.merge_dedup == "sort") {
+    uint64_t budget = static_cast<uint64_t>(opt.sort_memory_mb * (1ULL << 20));
+    uint64_t available = AvailableMemoryBytes();
+    if (opt.host_mem) available = available ? std::min(available, static_cast<uint64_t>(opt.host_mem))
+                                          : static_cast<uint64_t>(opt.host_mem);
+    if (available) budget = std::min(budget, available / 4);
+    if (budget < (64ULL << 10)) throw std::runtime_error("Insufficient memory for exact-sort buffers");
+    exact = MakeExactMergeDedup(active_words, opt.num_threads, budget, opt.output_prefix);
+    xinfo("Merge dedup: exact sort, {} record-buffer bytes, no merge Bloom filters\n", budget);
+  } else {
+    uint64_t bloom_byte_cap = SelectBloomByteCap(opt);
+    uint64_t merge_bloom_bytes = std::max<uint64_t>(2ULL << 20, bloom_byte_cap / 2);
+    uint64_t read_count_target_bytes = std::max<uint64_t>(1ULL << 20, expected_merge_items * 64ULL);
+    uint64_t extension_target_bytes = std::max<uint64_t>(1ULL << 20, expected_merge_items * 64ULL);
+    uint64_t read_count_bloom_bytes = std::min(merge_bloom_bytes, read_count_target_bytes);
+    uint64_t extension_bloom_bytes = std::min(merge_bloom_bytes, extension_target_bytes);
+    read_count_edges.reset(new BloomFilter(read_count_bloom_bytes * 8,
                                ChooseHashCount(read_count_bloom_bytes * 8,
                                                expected_merge_items,
-                                               opt.max_hashes));
-  BloomFilter emitted_extensions(extension_bloom_bytes * 8,
+                                               opt.max_hashes)));
+    emitted_extensions.reset(new BloomFilter(extension_bloom_bytes * 8,
                                  ChooseHashCount(extension_bloom_bytes * 8,
                                                  expected_merge_items,
-                                                 opt.max_hashes));
-  MergeQueryIndex prefix_queries(overlap_len), suffix_queries(overlap_len);
+                                                 opt.max_hashes)));
+    xinfo("Merge dedup: Bloom, {} filter bytes\n", read_count_bloom_bytes + extension_bloom_bytes);
+  }
+  const auto index_started = Clock::now();
+  MergeQueryIndex prefix_queries(overlap_len, opt.merge_index), suffix_queries(overlap_len, opt.merge_index);
   std::vector<std::unique_ptr<PackedMergeContig>> short_contigs;
   uint64_t contig_seen = 0;
   if (!opt.contig_file.empty()) {
@@ -959,6 +1065,13 @@ int RunMerge(const Options &opt) {
       short_contigs.push_back(std::move(contig));
     }
   }
+  prefix_queries.Build(opt.num_threads);
+  suffix_queries.Build(opt.num_threads);
+  const auto indexed = Clock::now();
+  xinfo("Merge index: {s}, {} prefix keys, {} suffix keys, {} FM bytes, build seconds {}\n",
+        opt.merge_index.c_str(), prefix_queries.size(), suffix_queries.size(),
+        prefix_queries.fm_bytes() + suffix_queries.fm_bytes(),
+        std::chrono::duration<double>(indexed - index_started).count());
 
   uint64_t base_seen = 0;
   uint64_t base_added = 0;
@@ -967,60 +1080,97 @@ int RunMerge(const Options &opt) {
   uint64_t orientations_scanned = 0;
   uint64_t matched_orientations = 0;
   struct FileMatches {
-    std::vector<KmerKey> edges;
+    struct Hit { size_t prefix, suffix; };
+    std::vector<uint64_t> words;
+    std::vector<Hit> hits;
     uint64_t records{0};
     uint64_t duplicates{0};
     uint64_t orientations{0};
   };
-  std::vector<FileMatches> file_matches(base_meta.num_files);
   const MergeQueryIndex &prefix_lookup = prefix_queries;
   const MergeQueryIndex &suffix_lookup = suffix_queries;
   // Diagnostic duplicate counts observe insertion order, so retain a serial scan there.
-  int scan_workers = opt.human_readable ? 1 : std::max(1, std::min(
-      opt.num_threads, static_cast<int>(base_meta.num_files)));
+  int scan_workers = opt.human_readable ? 1 : opt.num_threads;
+  bool split_files = !opt.human_readable && base_meta.num_files < static_cast<unsigned>(scan_workers);
+  std::vector<EdgeRange> scan_ranges;
+  if (split_files) scan_ranges = ReductionRanges(opt.long_prefix, base_meta, scan_workers);
+  std::vector<FileMatches> file_matches(split_files ? scan_ranges.size() : base_meta.num_files);
 
+  // With fewer input files than workers, copy their base records once in order,
+  // then parallelize the CPU-heavy Bloom/search pass over record ranges. This
+  // extra input pass preserves the historical output shard and record order.
+  if (split_files) {
 #pragma omp parallel for schedule(static) num_threads(scan_workers)
-  for (int owner = 0; owner < scan_workers; ++owner) {
-    // Files mapping to the same output stream have exactly one worker owner.
-    for (int file_id = owner; file_id < static_cast<int>(base_meta.num_files);
-         file_id += scan_workers) {
-      FileMatches &matches = file_matches[file_id];
+    for (unsigned file = 0; file < base_meta.num_files; ++file)
+      ForEachEdgeInFile(opt.long_prefix, base_meta, file, [&](const uint32_t *edge) {
+        writer.Write(edge, file, "read_count_base");
+      });
+  }
+
+  auto scan = [&](const EdgeRange &range, FileMatches &matches, bool write_base) {
       auto match_orientation = [&](const KmerKey &edge) {
         ++matches.orientations;
-        if (prefix_lookup.Has(PackedKeySlice(edge, 0, overlap_len)) ||
-            suffix_lookup.Has(PackedKeySlice(edge, edge_len - overlap_len, overlap_len))) {
-          matches.edges.push_back(edge);
+        size_t prefix = prefix_lookup.FindId(PackedKeySlice(edge, 0, overlap_len));
+        size_t suffix = suffix_lookup.FindId(PackedKeySlice(edge, edge_len - overlap_len, overlap_len));
+        if (prefix != EndFmIndex::Missing() || suffix != EndFmIndex::Missing()) {
+          matches.words.insert(matches.words.end(), edge.words, edge.words + active_words);
+          matches.hits.push_back({prefix, suffix});
         }
       };
-      ForEachEdgeInFile(opt.long_prefix, base_meta, file_id, [&](const uint32_t *edge) {
+      ForEachEdgeRange(opt.long_prefix, base_meta, range.file_id, range.first, range.count,
+                       [&](const uint32_t *edge) {
         ++matches.records;
         KmerKey forward = RawKeyFromEdge(edge, 0, edge_len);
         KmerKey reverse = PackedReverseComplement(forward, edge_len);
         const KmerKey &key = PackedKeyLess(reverse, forward) ? reverse : forward;
-        if (opt.human_readable && read_count_edges.Contains(key)) ++matches.duplicates;
-        read_count_edges.Add(key);
-        writer.Write(edge, file_id, "read_count_base");
+        if (exact) {
+          int worker = 0;
+#ifdef _OPENMP
+          worker = omp_get_thread_num();
+#endif
+          exact->AddBase(key.words, worker);
+        } else {
+          if (opt.human_readable && read_count_edges->Contains(key)) ++matches.duplicates;
+          read_count_edges->Add(key);
+        }
+        if (write_base) writer.Write(edge, range.file_id, "read_count_base");
 
         match_orientation(forward);
         if (!(reverse == forward)) match_orientation(reverse);
       });
+  };
+  if (split_files) {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(scan_workers)
+    for (size_t i = 0; i < scan_ranges.size(); ++i) scan(scan_ranges[i], file_matches[i], false);
+  } else {
+#pragma omp parallel for schedule(static) num_threads(scan_workers)
+    for (int owner = 0; owner < scan_workers; ++owner) {
+      // Files mapping to the same output stream have exactly one worker owner.
+      for (unsigned file = owner; file < base_meta.num_files; file += scan_workers)
+        scan({file, 0, FileRecordCount(opt.long_prefix, base_meta, file)}, file_matches[file], true);
     }
   }
+  const auto scanned = Clock::now();
+  if (exact) exact->Check();
   // The barrier above completes the read Bloom before any extension checks it.
-  for (const FileMatches &matches : file_matches) {
+  for (FileMatches &matches : file_matches) {
     base_seen += matches.records;
     base_duplicate += matches.duplicates;
     orientations_scanned += matches.orientations;
-    matched_orientations += matches.edges.size();
-    for (const KmerKey &edge : matches.edges) {
-      auto prefix_hits = prefix_queries.Find(PackedKeySlice(edge, 0, overlap_len));
-      auto suffix_hits = suffix_queries.Find(PackedKeySlice(edge, edge_len - overlap_len, overlap_len));
-      if (prefix_hits) prefix_hits->push_back(edge);
-      if (suffix_hits) suffix_hits->push_back(edge);
+    matched_orientations += matches.hits.size();
+    for (size_t i = 0; i < matches.hits.size(); ++i) {
+      KmerKey edge;
+      std::copy_n(matches.words.data() + i * active_words, active_words, edge.words);
+      auto hit = matches.hits[i];
+      if (hit.prefix != EndFmIndex::Missing()) prefix_queries.Hits(hit.prefix).push_back(edge);
+      if (hit.suffix != EndFmIndex::Missing()) suffix_queries.Hits(hit.suffix).push_back(edge);
     }
+    std::vector<uint64_t>().swap(matches.words);
+    std::vector<FileMatches::Hit>().swap(matches.hits);
   }
   base_added = base_seen;
   file_matches.clear();
+  const auto consolidated = Clock::now();
 
   uint64_t contig_orientations = 0;
   uint64_t overlap_matches = 0;
@@ -1053,10 +1203,11 @@ int RunMerge(const Options &opt) {
       KmerKey key;
       if (!CanonicalPackedWindow(extended, i, edge_len, &key)) continue;
       ++extended_windows_seen;
+      if (exact) { exact->AddCandidate(key.words, extended_windows_seen); continue; }
       const char *duplicate_source = nullptr;
-      if (read_count_edges.Contains(key)) {
+      if (read_count_edges->Contains(key)) {
         duplicate_source = "read_count_base_bloom";
-      } else if (emitted_extensions.Contains(key)) {
+      } else if (emitted_extensions->Contains(key)) {
         duplicate_source = "contig_overlap_extension_bloom";
       }
       if (duplicate_source != nullptr) {
@@ -1068,7 +1219,7 @@ int RunMerge(const Options &opt) {
                       << duplicate_source << '\n';
         continue;
       }
-      emitted_extensions.Add(key);
+      emitted_extensions->Add(key);
       PackKeyAsEdge(key, edge_len, base_meta.words_per_edge,
                     kContigEdgeMultiplicity, &packed);
       writer.Write(packed.data(), extended_edges_added % opt.num_threads,
@@ -1110,6 +1261,7 @@ int RunMerge(const Options &opt) {
     }
   }
 
+  const uint64_t long_candidate_start = extended_windows_seen;
   if (!opt.long_contig_file.empty()) {
     std::ifstream long_contigs(opt.long_contig_file);
     std::string name, seq;
@@ -1128,7 +1280,34 @@ int RunMerge(const Options &opt) {
       long_contig_edges_duplicate += extended_edges_duplicate - before_duplicate;
     }
   }
+  if (exact) {
+    const auto generated = Clock::now();
+    std::vector<uint32_t> packed;
+    exact->Finish([&](const uint64_t *words, uint64_t ordinal) {
+      KmerKey key;
+      std::copy_n(words, active_words, key.words);
+      PackKeyAsEdge(key, edge_len, base_meta.words_per_edge, kContigEdgeMultiplicity, &packed);
+      writer.Write(packed.data(), extended_edges_added % opt.num_threads, "contig_overlap_extension");
+      ++extended_edges_added;
+      if (ordinal > long_candidate_start) ++long_contig_edges_added;
+    });
+    extended_edges_duplicate = extended_windows_seen - extended_edges_added;
+    long_contig_edges_duplicate = long_contig_windows_seen - long_contig_edges_added;
+    auto stats = exact->Stats();
+    xinfo("Exact sort: {} candidates, {} new edges, {} duplicate candidates, {} runs, {} temporary bytes written, {} temporary bytes read, finalize seconds {}\n",
+          extended_windows_seen, extended_edges_added, extended_edges_duplicate, stats.runs_written,
+          stats.bytes_written, stats.bytes_read,
+          std::chrono::duration<double>(Clock::now() - generated).count());
+  }
   writer.Finalize();
+  const auto finished = Clock::now();
+  xinfo("Merge seconds: setup {}, index {}, scan {}, consolidate {}, extend/write {}, total {} ({} scan workers)\n",
+        std::chrono::duration<double>(index_started - started).count(),
+        std::chrono::duration<double>(indexed - index_started).count(),
+        std::chrono::duration<double>(scanned - indexed).count(),
+        std::chrono::duration<double>(consolidated - scanned).count(),
+        std::chrono::duration<double>(finished - consolidated).count(),
+        std::chrono::duration<double>(finished - started).count(), scan_workers);
 
   if (opt.human_readable) {
     std::ofstream summary(opt.output_prefix + ".merge.summary.txt");
@@ -1141,20 +1320,20 @@ int RunMerge(const Options &opt) {
   summary << "base_edges_seen\t" << base_seen << '\n';
   summary << "base_edges_added\t" << base_added << '\n';
   summary << "base_edges_bloom_hits\t" << base_duplicate << '\n';
-  summary << "merge_read_count_bloom_bits\t" << read_count_edges.num_bits() << '\n';
-  summary << "merge_read_count_bloom_bytes\t" << read_count_edges.num_bytes() << '\n';
-  summary << "merge_read_count_bloom_hashes\t" << read_count_edges.num_hashes() << '\n';
+  summary << "merge_read_count_bloom_bits\t" << read_count_edges->num_bits() << '\n';
+  summary << "merge_read_count_bloom_bytes\t" << read_count_edges->num_bytes() << '\n';
+  summary << "merge_read_count_bloom_hashes\t" << read_count_edges->num_hashes() << '\n';
   summary << "merge_read_count_bloom_estimated_fpr\t"
           << std::setprecision(12)
-          << EstimateFpr(read_count_edges.num_bits(), expected_merge_items,
-                         read_count_edges.num_hashes()) << '\n';
-  summary << "merge_extension_bloom_bits\t" << emitted_extensions.num_bits() << '\n';
-  summary << "merge_extension_bloom_bytes\t" << emitted_extensions.num_bytes() << '\n';
-  summary << "merge_extension_bloom_hashes\t" << emitted_extensions.num_hashes() << '\n';
+          << EstimateFpr(read_count_edges->num_bits(), expected_merge_items,
+                         read_count_edges->num_hashes()) << '\n';
+  summary << "merge_extension_bloom_bits\t" << emitted_extensions->num_bits() << '\n';
+  summary << "merge_extension_bloom_bytes\t" << emitted_extensions->num_bytes() << '\n';
+  summary << "merge_extension_bloom_hashes\t" << emitted_extensions->num_hashes() << '\n';
   summary << "merge_extension_bloom_estimated_fpr\t"
           << std::setprecision(12)
-          << EstimateFpr(emitted_extensions.num_bits(), expected_merge_items,
-                         emitted_extensions.num_hashes()) << '\n';
+          << EstimateFpr(emitted_extensions->num_bits(), expected_merge_items,
+                         emitted_extensions->num_hashes()) << '\n';
   summary << "long_oriented_edges_scanned\t" << orientations_scanned << '\n';
   summary << "long_oriented_edges_matched\t" << matched_orientations << '\n';
   summary << "prefix_query_keys\t" << prefix_queries.size() << '\n';
@@ -1183,9 +1362,15 @@ int RunMerge(const Options &opt) {
 }  // namespace
 
 int main_prefix_bloom(int argc, char **argv) {
-  Options opt = ParseOptions(argc, argv);
-  if (opt.mode == "merge") return RunMerge(opt);
-  if (opt.mode == "reduce") return RunReduce(opt);
-  xfatal("Unknown prefixbf mode {s}\n", opt.mode.c_str());
-  return 1;
+  try {
+    Options opt = ParseOptions(argc, argv);
+    if (opt.mode == "merge") return RunMerge(opt);
+    if (opt.mode == "index-bench") return RunIndexBenchmark(opt);
+    if (opt.mode == "reduce") return RunReduce(opt);
+    xfatal("Unknown prefixbf mode {s}\n", opt.mode.c_str());
+    return 1;
+  } catch (const std::exception &error) {
+    std::cerr << "prefixbf: " << error.what() << '\n';
+    return 1;
+  }
 }

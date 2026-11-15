@@ -61,6 +61,13 @@ set_source_files_properties(src/flash/flash.c PROPERTIES
 target_link_libraries(flash PUBLIC ${ZLIB_LIBRARIES} Threads::Threads)
 add_subdirectory(src/minimap2)
 
+add_library(libsais STATIC src/vendor/libsais/src/libsais.c src/vendor/libsais/src/libsais64.c)
+set_target_properties(libsais PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
+target_compile_definitions(libsais PUBLIC LIBSAIS_OPENMP)
+target_include_directories(libsais PUBLIC ${CMAKE_SOURCE_DIR}/src/vendor/libsais/include)
+target_compile_options(libsais PRIVATE ${OpenMP_C_FLAGS})
+target_link_libraries(libsais PUBLIC ${OpenMP_C_FLAGS})
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DXXH_INLINE_ALL -ftemplate-depth=3000")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unused-function")
@@ -101,7 +108,8 @@ set(MEGAHIT_CORE_SOURCE
         ${BLOOM_FILTER_SOURCE})
 
 add_library(megahit_objects OBJECT ${MEGAHIT_CORE_SOURCE})
-target_include_directories(megahit_objects PRIVATE ${ZLIB_INCLUDE_DIRS})
+target_include_directories(megahit_objects PRIVATE ${ZLIB_INCLUDE_DIRS} src/vendor/libsais/include)
+target_compile_definitions(megahit_objects PRIVATE LIBSAIS_OPENMP)
 add_executable(megahit_core EXCLUDE_FROM_ALL src/native/core_entry.cpp $<TARGET_OBJECTS:megahit_objects>)
 
 
@@ -112,7 +120,7 @@ if (STATIC_BUILD)
     set_target_properties(megahit_core PROPERTIES LINK_SEARCH_END_STATIC ON)
 endif (STATIC_BUILD)
 
-target_link_libraries(megahit_core ${ZLIB_LIBRARIES} flash minimap2)
+target_link_libraries(megahit_core ${ZLIB_LIBRARIES} flash minimap2 libsais)
 
 file(GLOB PIGZ_EMBED_DEPENDENCIES "${CMAKE_SOURCE_DIR}/src/pigz/*")
 add_custom_command(
@@ -133,7 +141,7 @@ add_executable(megahit src/native/entry.cpp src/native/platform.cpp src/native/w
         ${CMAKE_CURRENT_BINARY_DIR}/native_pigz.cpp $<TARGET_OBJECTS:megahit_objects>)
 target_include_directories(megahit PRIVATE ${ZLIB_INCLUDE_DIRS} ${BZIP2_INCLUDE_DIR})
 target_compile_definitions(megahit PRIVATE MEGAHIT_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/test_data")
-target_link_libraries(megahit ${ZLIB_LIBRARIES} ${BZIP2_LIBRARIES} flash minimap2)
+target_link_libraries(megahit ${ZLIB_LIBRARIES} ${BZIP2_LIBRARIES} flash minimap2 libsais)
 if(STATIC_BUILD)
     set_target_properties(megahit PROPERTIES LINK_SEARCH_START_STATIC ON LINK_SEARCH_END_STATIC ON)
 endif()
@@ -201,6 +209,12 @@ add_custom_target(native_workflow_test
 add_custom_target(reduction_test
         COMMAND ${CMAKE_COMMAND} -E env "MEGAHIT_TEST_CORE=$<TARGET_FILE:megahit_core>"
                 python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_reduce.py
+        DEPENDS megahit_core
+        VERBATIM)
+
+add_custom_target(merge_dedup_test
+        COMMAND ${CMAKE_COMMAND} -E env "MEGAHIT_TEST_CORE=$<TARGET_FILE:megahit_core>"
+                python3 -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_merge_dedup.py
         DEPENDS megahit_core
         VERBATIM)
 

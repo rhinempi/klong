@@ -97,11 +97,14 @@ class NativeWorkflowTest(unittest.TestCase):
         self.assertTrue((output / 'done').exists())
         options = json.loads((output / 'options.json').read_text())
         self.assertEqual(options['workflow_driver'], 'native-cpp-v1')
+        self.assertEqual(options['merge_dedup'], 'sort')
+        self.assertEqual(options['merge_sort_memory'], 128)
         expected = [sequence for pair in zip(self.left, self.right) for _, sequence in pair]
         self.assertEqual(binary_sequences(output / 'tmp/reads.lib.bin'), expected)
         merged = fasta(output / 'tmp/flash/library.0.merged.fa.gz')
         self.assertEqual(collections.Counter(merged.values()), collections.Counter(self.merged))
         log = (output / 'log').read_text()
+        self.assertIn('no merge Bloom filters', log)
         assembled = re.findall(r'Assemble contigs from SdBG for k = (\d+)', log)
         order = list(map(int, assembled))
         expected_order = [21, 39, 59, 21, 39, 59, 79]
@@ -137,6 +140,49 @@ class NativeWorkflowTest(unittest.TestCase):
                          collections.Counter(self.merged))
         # Completed-run continuation does not attempt to rebuild removed scratch.
         self.invoke(['--continue', '-o', output])
+
+    def test_hash_merge_backend_remains_selectable(self):
+        output = self.assemble('hash merge backend', extra=['--merge-index', 'hash'])
+        self.assertEqual(json.loads((output / 'options.json').read_text())['merge_index'], 'hash')
+        self.assertIn('Merge index: hash', (output / 'log').read_text())
+        self.assertTrue((output / 'done').exists())
+
+    def test_fm_merge_backend_integrates_with_native_workflow(self):
+        output = self.assemble('fm merge backend', extra=['--merge-index', 'fm'])
+        self.assertEqual(json.loads((output / 'options.json').read_text())['merge_index'], 'fm')
+        self.assertIn('Merge index: fm', (output / 'log').read_text())
+        self.assertTrue((output / 'done').exists())
+
+    def test_exact_sort_dedup_integrates_with_native_workflow_and_resume(self):
+        output = self.assemble('sort merge dedup', extra=['--merge-dedup', 'sort', '--merge-sort-memory', '0.125'])
+        options = json.loads((output / 'options.json').read_text())
+        self.assertEqual(options['merge_dedup'], 'sort')
+        self.assertEqual(options['merge_sort_memory'], 0.125)
+        self.assertIn('no merge Bloom filters', (output / 'log').read_text())
+        self.assertFalse(list((output / 'tmp').rglob('*.sort-*')))
+        final = output / 'final.contigs.fa'
+        before = final.read_bytes()
+        final.unlink()
+        (output / 'done').unlink()
+        self.invoke(['--continue', '-o', output])
+        self.assertEqual(final.read_bytes(), before)
+
+    def test_bloom_dedup_and_legacy_resume_preserve_backend(self):
+        output = self.assemble('bloom merge dedup', extra=['--merge-dedup', 'bloom'])
+        options_path = output / 'options.json'
+        options = json.loads(options_path.read_text())
+        self.assertEqual(options['merge_dedup'], 'bloom')
+        self.invoke(['--continue', '-o', output])
+        self.assertEqual(json.loads(options_path.read_text())['merge_dedup'], 'bloom')
+        del options['merge_dedup']
+        options_path.write_text(json.dumps(options))
+        final = output / 'final.contigs.fa'
+        before = final.read_bytes()
+        final.unlink()
+        (output / 'done').unlink()
+        self.invoke(['--continue', '-o', output])
+        self.assertEqual(json.loads(options_path.read_text())['merge_dedup'], 'bloom')
+        self.assertEqual(final.read_bytes(), before)
 
     def test_reduction_keeps_counted_edges_without_preliminary_graphs(self):
         output = self.assemble('edges-only reduction', extra=['-t', '1'])
@@ -234,7 +280,9 @@ class NativeWorkflowTest(unittest.TestCase):
         self.assertTrue((output / 'done').exists())
 
     def test_rejects_legacy_checkpoints_and_bad_options(self):
-        for options in [['--k-step', '0'], ['--k-list', '21,21'], ['--flash-min-overlap', '0']]:
+        for options in [['--k-step', '0'], ['--k-list', '21,21'], ['--flash-min-overlap', '0'],
+                        ['--merge-index', 'invalid'], ['--merge-dedup', 'invalid'],
+                        ['--merge-sort-memory', '0']]:
             result = self.invoke(['-r', self.first, '-o', self.root / ('bad-' + options[0][2:])] + options, check=False)
             self.assertNotEqual(result.returncode, 0)
         legacy = self.root / 'legacy'

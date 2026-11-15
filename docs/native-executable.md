@@ -62,6 +62,12 @@ versions remain usable; obsolete read-counted graph checkpoints are ignored.
 Reduction uses bounded block I/O, packed-word operations, and chunk-based workers;
 its Bloom allocation now receives the workflow memory budget. See
 [Edge Reduction Performance](reduction-performance.md) for parameters and benchmarks.
+Contig-end matching also supports `--merge-index fm` for an exact BWT/FM-index
+backend. Hash remains the measured default; see
+[Contig-End FM Index](merge-fm-index.md) for parallelism and comparison results.
+The default `--merge-dedup sort` replaces merge Bloom filtering with exact external sorting;
+see [Exact Sort-Based Merge Deduplication](merge-sort-dedup.md) for memory/disk
+tradeoffs, measurements, and reproduction commands.
 
 Native runs write `options.json` with `workflow_driver: native-cpp-v1` and
 `checkpoints.native.json`. Resume validates input paths, sizes, and modification

@@ -49,7 +49,7 @@ class BinaryOnlyReductionTest(unittest.TestCase):
         else:
             contigs = self.root / 'contigs.fa'
             contigs.write_text('>contig\nCAATTT\n')
-            command += ['--contig', str(contigs)]
+            command += ['--contig', str(contigs), '--merge_dedup', 'bloom']
         if report is not None:
             command += ['--human_readable', str(report)]
         subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
