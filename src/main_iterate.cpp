@@ -66,7 +66,7 @@ static void ParseIterOptions(int argc, char *argv[]) {
                  "number of cpu threads, at least 2. 0 for auto detect.");
   desc.AddOption("kmer_k", "k", opt.kmer_k, "(*) current kmer size.");
   desc.AddOption("step", "s", opt.step,
-                 "(*) step for iteration (<= 28). i.e. this iteration is from "
+                 "(*) step for iteration (<= 40). i.e. this iteration is from "
                  "kmer_k to (kmer_k + step)");
   desc.AddOption("output_prefix", "o", opt.output_prefix,
                  "(*) output_prefix.edges.0 will be created.");
@@ -89,7 +89,7 @@ static void ParseIterOptions(int argc, char *argv[]) {
       throw std::logic_error("No reads file!");
     } else if (opt.kmer_k <= 0) {
       throw std::logic_error("Invalid kmer size!");
-    } else if (opt.step <= 0 || opt.step > 28 || opt.step % 2 == 1) {
+    } else if (opt.step <= 0 || opt.step > 40 || opt.step % 2 == 1) {
       throw std::logic_error("Invalid step size!");
     } else if (opt.output_prefix == "") {
       throw std::logic_error("No output prefix!");

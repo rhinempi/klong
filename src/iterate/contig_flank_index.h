@@ -16,8 +16,9 @@ template <class KmerType>
 class ContigFlankIndex {
  public:
   struct FlankInfo {
-    uint64_t ext_seq : 58;
-    unsigned ext_len : 6;
+    uint64_t ext_seq;
+    uint32_t ext_seq_hi : 26;
+    uint32_t ext_len : 6;
     float mul;
   } __attribute__((packed));
   using Flank = KmerPlus<KmerType, FlankInfo>;
@@ -54,20 +55,25 @@ class ContigFlankIndex {
         unsigned ext_len =
             std::min(static_cast<size_t>(step_ - 1), seq_len - (k_ + 1));
         uint64_t ext_seq = 0;
+        uint32_t ext_seq_hi = 0;
         for (unsigned j = 0; j < ext_len; ++j) {
-          ext_seq |= uint64_t(get_jth_char(k_ + 1 + j)) << j * 2;
+          uint8_t base = get_jth_char(k_ + 1 + j);
+          if (j < 32) ext_seq |= uint64_t(base) << (j * 2);
+          else ext_seq_hi |= uint32_t(base) << ((j - 32) * 2);
         }
 
         {
           std::lock_guard<SpinLock> lk(lock);
-          auto res = hash_index_.emplace(kmer, FlankInfo{ext_seq, ext_len});
+          auto res = hash_index_.emplace(kmer, FlankInfo{ext_seq, ext_seq_hi, ext_len, 0});
           if (!res.second) {
             auto old_len = res.first->aux.ext_len;
             auto old_seq = res.first->aux.ext_seq;
+            auto old_seq_hi = res.first->aux.ext_seq_hi;
             if (old_len < ext_len ||
-                (old_len == ext_len && old_seq < ext_seq)) {
+                (old_len == ext_len && (old_seq_hi < ext_seq_hi ||
+                 (old_seq_hi == ext_seq_hi && old_seq < ext_seq)))) {
               hash_index_.erase(res.first);
-              res = hash_index_.emplace(kmer, FlankInfo{ext_seq, ext_len});
+              res = hash_index_.emplace(kmer, FlankInfo{ext_seq, ext_seq_hi, ext_len, 0});
               assert(res.second);
             }
           }
@@ -119,6 +125,7 @@ class ContigFlankIndex {
           if (iter != hash_index_.end()) {
             kmer_exist[cur_pos] = true;
             uint64_t ext_seq = iter->aux.ext_seq;
+            uint64_t ext_seq_hi = iter->aux.ext_seq_hi;
             unsigned ext_len = iter->aux.ext_len;
             float mul = iter->aux.mul;
             kmer_mul[cur_pos] = mul;
@@ -126,7 +133,7 @@ class ContigFlankIndex {
             for (unsigned j = 0; j < ext_len && cur_pos + k_ + 1 + j < length;
                  ++j, ++next_pos) {
               if (seq_view.base_at(cur_pos + k_ + 1 + j) ==
-                  ((ext_seq >> j * 2u) & 3u)) {
+                  (((j < 32 ? ext_seq : ext_seq_hi) >> ((j % 32) * 2u)) & 3u)) {
                 kmer_exist[cur_pos + j + 1] = true;
                 kmer_mul[cur_pos + j + 1] = mul;
               } else {
@@ -136,6 +143,7 @@ class ContigFlankIndex {
           }
           if ((iter = hash_index_.find(rflank)) != hash_index_.end()) {
             uint64_t ext_seq = iter->aux.ext_seq;
+            uint64_t ext_seq_hi = iter->aux.ext_seq_hi;
             unsigned ext_len = iter->aux.ext_len;
             float mul = iter->aux.mul;
             kmer_mul[cur_pos] =
@@ -144,7 +152,7 @@ class ContigFlankIndex {
 
             for (unsigned j = 0; j < ext_len && cur_pos >= j + 1; ++j) {
               if ((3u ^ seq_view.base_at(cur_pos - 1 - j)) ==
-                  ((ext_seq >> j * 2u) & 3u)) {
+                  (((j < 32 ? ext_seq : ext_seq_hi) >> ((j % 32) * 2u)) & 3u)) {
                 kmer_mul[cur_pos - 1 - j] =
                     kmer_exist[cur_pos - 1 - j]
                         ? (kmer_mul[cur_pos - 1 - j] + mul) / 2

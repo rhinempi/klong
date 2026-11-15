@@ -48,11 +48,39 @@ FIFOs when constructing the original read library. FASTA formatting is native.
 
 ## Workflow And Resume
 
-Reduction/merge runs through the last requested k<=60. Its contigs and consensus
-extensions seed a fresh graph at the minimum requested k. The flanking pass then
-follows the full requested k-list. The same 290-base end extraction, Minimap2
+Reduction/merge defaults to `21,29,39,59`; consensus flanking defaults to
+`21,31,41,61,81,101,141`. Set them independently:
+
+```sh
+megahit -1 R1.fq.gz -2 R2.fq.gz --merge-pairs -o output \
+  --reduction-k-list 21,29,39,59 \
+  --flanking-k-list 21,31,41,61,81,101,141
+```
+
+Each list must be strictly increasing, with odd values in [15,255]. Adjacent
+reduction steps may be at most 28; flanking steps may be at most 40. Explicit
+reduction lists are not restricted to k<=60. The last reduction assembly and its
+consensus extensions seed a fresh graph at the first flanking k, which may differ
+from the first reduction k. The same 290-base end extraction, Minimap2
 parameters, extended-only consensus local files, and binary edge formats are used.
 Final contigs are filtered and merged in C++ without shell pipelines.
+
+For compatibility, `--k-list`, `--k-min/--k-max/--k-step`, and presets retain their
+shared-list behavior: reduction uses entries <=60 and flanking uses the full list.
+A phase-specific list overrides that phase regardless of CLI option order.
+Explicit phase lists and the new defaults are not shortened based on read length.
+Both lists are saved in `options.json`; continuation restores them. Older native
+runs without these fields retain their historical shared-list behavior.
+
+`--flanking-consensus-only` skips read-derived iterative `.edges.*` generation
+throughout the flanking pass. Each new SdBG instead uses retained contigs,
+bubble/additional contig sequences, and consensus `.local.fa` sequences. Stale
+iterative edge files are ignored. Retained contigs can carry an iteration forward
+even without new consensus extensions. Reduction and the initial seeding graph
+are unchanged. The option is off by default and saved for native resume; use a
+fresh output directory to change an existing run's mode. Use `--merge-pairs` to
+provide FLASH-merged reads for consensus; without merged reads or with
+`--no-local`, this mode can only rebuild from retained contig sequences.
 
 Look-ahead counting retains only binary `.edges.*` files; it does not build a
 preliminary read-counted SdBG. Reduction and merging consume those edges directly.

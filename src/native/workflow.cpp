@@ -65,6 +65,10 @@ struct Options {
        no_local = false, keep_tmp_files = false, kmin_1pass = false,
        debug_assembly = false, merge_pairs = false, verbose = false, hw_accel = true;
   std::vector<int> k_list{21, 29, 39, 59, 79, 99, 119, 141};
+  std::vector<int> reduction_k_list, flanking_k_list;
+  bool legacy_k_list = false;
+  bool reduction_k_list_set = false, flanking_k_list_set = false;
+  bool flanking_consensus_only = false;
   Args pe1, pe2, pe12, se;
   NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(Options, out_dir, temp_dir, out_prefix, presets, merge_index,
       merge_dedup, merge_sort_memory,
@@ -73,7 +77,9 @@ struct Options {
       max_tip_len, bubble_level, merge_len, prune_level, num_cpu_threads, cleaning_rounds,
       mem_flag, flash_min_overlap, flash_max_overlap, flash_phred_offset, test_mode,
       auto_k, set_list_by_min_max_step, no_mercy, no_local, keep_tmp_files, kmin_1pass,
-      debug_assembly, merge_pairs, verbose, hw_accel, k_list, pe1, pe2, pe12, se)
+      debug_assembly, merge_pairs, verbose, hw_accel, k_list, reduction_k_list,
+      flanking_k_list, legacy_k_list, reduction_k_list_set, flanking_k_list_set,
+      flanking_consensus_only, pe1, pe2, pe12, se)
 };
 const char *help = R"(MEGAHIT native C++ workflow (no Python runtime required)
 Usage: megahit [options] {-1 mates1 -2 mates2 | --12 interleaved | -r reads}
@@ -89,7 +95,10 @@ Inputs (repeatable, comma-separated; FASTA/FASTQ, plain/gzip/bzip2):
   --flash-phred-offset N       Quality offset, 33 or 64 [33]
 
 Assembly:
-  --k-list LIST                [21,29,39,59,79,99,119,141]
+  --reduction-k-list LIST      [21,29,39,59]
+  --flanking-k-list LIST       [21,31,41,61,81,101,141]
+  --flanking-consensus-only    Flanking uses retained contigs + consensus, no read edges
+  --k-list LIST                Legacy shared list: reduction k<=60, flanking all
   --k-min N --k-max N --k-step N  Override k-list; odd k, even step <=28
   --min-count N                Minimum edge multiplicity [2]
   --merge-index fm|hash        Exact contig-end overlap index [hash]
@@ -114,8 +123,10 @@ Resources and output:
   --force --verbose --test --no-human-readable-output
   -h, --help  -v, --version
 
-Reduction/merge runs through k<=60, then consensus flanking restarts at the
-minimum requested k and follows the full k-list. The final executable contains
+Reduction/merge follows its own list, then consensus flanking restarts at the
+first flanking k and follows its own list. Phase-specific options override the
+shared list for that phase. Reduction steps must be <=28, flanking steps <=40.
+The final executable contains
 the assembly core, FLASH, Minimap2, and optional pigz; gzip fallback uses zlib.
 Native checkpoints are separate from legacy Python checkpoints. Use a fresh
 output directory when switching from the legacy driver.
@@ -168,10 +179,20 @@ Options parse(int argc, char **argv) {
     else if (key == "--flash-max-overlap") opt.flash_max_overlap = integer(value());
     else if (key == "--flash-max-mismatch-density") opt.flash_max_mismatch_density = real(value());
     else if (key == "--flash-phred-offset") opt.flash_phred_offset = integer(value());
+    else if (key == "--reduction-k-list" || key == "--flanking-k-list") {
+      auto &list = key == "--reduction-k-list" ? opt.reduction_k_list : opt.flanking_k_list;
+      if (key == "--reduction-k-list") opt.reduction_k_list_set = true;
+      else opt.flanking_k_list_set = true;
+      list.clear(); for (const auto &k : split(value())) list.push_back(integer(k));
+      if (list.empty()) throw Error(key + " cannot be empty");
+      opt.auto_k = false;
+    }
     else if (key == "--k-list") {
+      opt.legacy_k_list = true;
       opt.k_list.clear(); for (const auto &k : split(value())) opt.k_list.push_back(integer(k));
       std::sort(opt.k_list.begin(), opt.k_list.end()); opt.auto_k = false; opt.set_list_by_min_max_step = false;
     } else if (key == "--k-min" || key == "--k-max" || key == "--k-step") {
+      opt.legacy_k_list = true;
       int k = integer(value());
       if (key == "--k-min") opt.k_min = k;
       else if (key == "--k-max") opt.k_max = k;
@@ -190,6 +211,7 @@ Options parse(int argc, char **argv) {
     } else if (key == "--merge-pairs") opt.merge_pairs = true;
     else if (key == "--no-mercy") opt.no_mercy = true;
     else if (key == "--no-local") opt.no_local = true;
+    else if (key == "--flanking-consensus-only") opt.flanking_consensus_only = true;
     else if (key == "--kmin-1pass") opt.kmin_1pass = true;
     else if (key == "--no-hw-accel") opt.hw_accel = false;
     else if (key == "--keep-tmp-files") opt.keep_tmp_files = true;
@@ -234,12 +256,15 @@ class Driver {
     mkdirs(directory); return directory + "/" + number(k);
   }
   std::string read_count(int k) const { return reduction_path(k, "read_count"); }
+  int initial_k() const {
+    return opt.reduction_k_list.empty() ? opt.flanking_k_list.front() : opt.reduction_k_list.front();
+  }
   std::string current_edges(int k) const {
     for (const auto &type : {"merged_edges", "reduced_edges"}) {
       auto prefix = reduction_path(k, type);
       if (exists(prefix + ".edges.info")) return prefix;
     }
-    return k == opt.k_min ? graph(k) : read_count(k);
+    return k == initial_k() ? graph(k) : read_count(k);
   }
   std::string lib() const { return opt.temp_dir + "/reads.lib"; }
   std::string ends(int k) const {
@@ -301,7 +326,8 @@ class Driver {
   }
   void validate() {
     if (!opt.presets.empty()) {
-      opt.auto_k = true; opt.min_count = 1;
+      opt.auto_k = !opt.reduction_k_list_set && !opt.flanking_k_list_set;
+      opt.legacy_k_list = true; opt.min_count = 1;
       if (opt.presets == "meta-sensitive") {
         opt.k_list = {21,29,39,49,59,69,79,89,99,109,119,129,141}; opt.set_list_by_min_max_step = false;
       } else if (opt.presets == "meta-large") {
@@ -324,6 +350,24 @@ class Driver {
         throw Error("k-list must increase strictly, with adjacent difference <=28");
     }
     opt.k_min = opt.k_list.front(); opt.k_max = opt.k_list.back();
+    if (opt.reduction_k_list.empty()) {
+      if (opt.legacy_k_list) {
+        for (int k : opt.k_list) if (k <= 60) opt.reduction_k_list.push_back(k);
+      } else opt.reduction_k_list = {21,29,39,59};
+    }
+    if (opt.flanking_k_list.empty())
+      opt.flanking_k_list = opt.legacy_k_list ? opt.k_list : std::vector<int>{21,31,41,61,81,101,141};
+    auto check_list = [&](const std::vector<int> &list, const std::string &name, int max_step) {
+      for (size_t i = 0; i < list.size(); ++i) {
+        int k = list[i];
+        if (k < 15 || k > static_cast<int>(kMaxK) || k % 2 == 0)
+          throw Error(name + " values must be odd and in [15,255]");
+        if (i && (k <= list[i - 1] || k - list[i - 1] > max_step))
+          throw Error(name + " must increase strictly, with adjacent difference <=" + number(max_step));
+      }
+    };
+    check_list(opt.reduction_k_list, "reduction-k-list", 28);
+    check_list(opt.flanking_k_list, "flanking-k-list", 40);
     if (opt.min_count <= 0 || opt.min_contig_len < 0) throw Error("Invalid minimum count/contig length");
     if (opt.min_count == 1) { opt.no_mercy = true; opt.kmin_1pass = true; }
     if (opt.memory <= 0 || !std::isfinite(opt.memory)) throw Error("Memory must be positive");
@@ -367,6 +411,8 @@ class Driver {
         throw Error("Legacy Python checkpoints cannot be resumed by the native driver; use a fresh output directory");
       std::string output = opt.out_dir;
       opt = saved.get<Options>(); opt.out_dir = output; opt.continue_mode = true;
+      if (!saved.contains("reduction_k_list") && !saved.contains("flanking_k_list"))
+        opt.legacy_k_list = true;
       // Native runs predating this option used Bloom deduplication.
       if (!saved.contains("merge_dedup")) opt.merge_dedup = "bloom";
       if (exists(checkpoints())) completed = read_json(checkpoints());
@@ -458,7 +504,7 @@ class Driver {
         remove_tree(input_workspace); input_workspace.clear();
       } catch (...) { stop_producers(); throw; }
     });
-    if (opt.auto_k && opt.k_list.size() > 1) {
+    if (opt.auto_k && opt.legacy_k_list && opt.k_list.size() > 1) {
       std::ifstream info(lib() + ".lib_info"); std::string line; int row = 0, maximum = 0;
       while (std::getline(info, line)) {
         if (row >= 2 && row % 2 == 0) { std::istringstream values(line); int64_t begin, end; int length;
@@ -467,7 +513,11 @@ class Driver {
       }
       std::vector<int> adjusted;
       for (int k : opt.k_list) if (k < maximum + 20) adjusted.push_back(k);
-      if (!adjusted.empty()) { opt.k_list = adjusted; opt.k_min = adjusted.front(); opt.k_max = adjusted.back(); }
+      if (!adjusted.empty()) {
+        opt.k_list = adjusted; opt.k_min = adjusted.front(); opt.k_max = adjusted.back();
+        opt.flanking_k_list = adjusted; opt.reduction_k_list.clear();
+        for (int k : adjusted) if (k <= 60) opt.reduction_k_list.push_back(k);
+      }
     }
   }
   std::string compressor() {
@@ -545,8 +595,8 @@ class Driver {
       remove_file(parent(prefix) + "/" + name);
   }
   std::string reduce(int from, int to) {
-    std::string input = from == opt.k_min ? graph(from) : reduction_path(from, "merged_edges");
-    if (!exists(input + ".edges.info") && from != opt.k_min) input = read_count(from);
+    std::string input = from == initial_k() ? graph(from) : reduction_path(from, "merged_edges");
+    if (!exists(input + ".edges.info") && from != initial_k()) input = read_count(from);
     std::string longer = read_count(to), output = reduction_path(from, "reduced_edges");
     checkpoint("reduce-k" + number(from) + "-k" + number(to), {output + ".edges.info"}, [&]() {
       if (!exists(input + ".edges.info") || !exists(longer + ".edges.info")) throw Error("Missing reduction input edges");
@@ -593,6 +643,8 @@ class Driver {
     });
   }
   void assemble(int k, const std::string &input, int next = 0) {
+    int final_k = opt.flanking_k_list.back();
+    if (!flanking && !opt.reduction_k_list.empty()) final_k = std::max(final_k, opt.reduction_k_list.back());
     Args outputs{contig(k) + ".contigs.fa", contig(k) + ".contigs.fa.info",
                  contig(k) + ".bubble_seq.fa", contig(k) + ".bubble_seq.fa.info"};
     if (next) { outputs.push_back(contig(k) + ".lt_k" + number(next) + "_plus1.contigs.fa");
@@ -601,8 +653,8 @@ class Driver {
       mkdirs(contig_dir());
       remove_file(contig(k) + ".addi.fa");
       remove_file(contig(k) + ".addi.fa.info");
-      int standalone = std::max(std::min(opt.k_max * 3 - 1, int(opt.min_contig_len * 1.5)), opt.min_contig_len);
-      if (opt.max_tip_len >= 0) standalone = std::max(opt.max_tip_len + opt.k_max - 1, opt.min_contig_len);
+      int standalone = std::max(std::min(final_k * 3 - 1, int(opt.min_contig_len * 1.5)), opt.min_contig_len);
+      if (opt.max_tip_len >= 0) standalone = std::max(opt.max_tip_len + final_k - 1, opt.min_contig_len);
       double tip = opt.max_tip_len;
       if (tip == -1 && k * 3 - 1 > opt.min_contig_len * 1.5) tip = std::max(1.0, opt.min_contig_len * 1.5 + 1 - k);
       Args args{"assemble", "-s", input, "-o", contig(k), "-t", number(opt.num_cpu_threads),
@@ -612,9 +664,9 @@ class Driver {
                 "--disconnect_ratio", number(opt.disconnect_ratio), "--low_local_ratio", number(opt.low_local_ratio),
                 "--min_depth", number(next ? 0 : opt.prune_depth), "--bubble_level", number(next ? 0 : opt.bubble_level),
                 "--max_tip_len", number(next ? 0 : tip)};
-      if (k < opt.k_max && !next) args.push_back("--careful_bubble");
-      if (k == opt.k_max) args.push_back("--is_final_round");
-      if (opt.no_local && (flanking || opt.k_min > 60)) args.push_back("--output_standalone");
+      if (k < final_k && !next) args.push_back("--careful_bubble");
+      if (k == final_k) args.push_back("--is_final_round");
+      if (opt.no_local && (flanking || opt.reduction_k_list.empty())) args.push_back("--output_standalone");
       core(args, "Assemble contigs from SdBG for k = " + number(k));
       if (next) split_contigs(k, next);
     });
@@ -625,7 +677,8 @@ class Driver {
       Args args{"seq2sdbg"}; auto common = graph_options(k, output, from);
       args.insert(args.end(), common.begin(), common.end());
       uint64_t bases = 0;
-      if (exists(output + ".edges.0")) {
+      bool consensus_only = opt.flanking_consensus_only && from;
+      if (!consensus_only && exists(output + ".edges.0")) {
         args.insert(args.end(), {"--input_prefix", output});
         for (int shard = 0; exists(output + ".edges." + number(shard)); ++shard)
           bases += size(output + ".edges." + number(shard));
@@ -637,10 +690,16 @@ class Driver {
           if (input.first == "--local_contig" && opt.no_local) continue;
           if (exists(prefix + input.second)) { args.insert(args.end(), {input.first, prefix + input.second}); bases += size(prefix + input.second); }
         }
-        if (exists(prefix + ".contigs.fa")) args.insert(args.end(), {"--contig", prefix + ".contigs.fa", "--bubble", prefix + ".bubble_seq.fa"});
+        if (exists(prefix + ".contigs.fa")) {
+          args.insert(args.end(), {"--contig", prefix + ".contigs.fa", "--bubble", prefix + ".bubble_seq.fa"});
+          if (consensus_only) {
+            bases += size(prefix + ".contigs.fa");
+            if (exists(prefix + ".bubble_seq.fa")) bases += size(prefix + ".bubble_seq.fa");
+          }
+        }
       }
       if (from && !bases) throw EarlyTerminate{from};
-      if (!opt.no_mercy && k == opt.k_min) args.push_back("--need_mercy");
+      if (!opt.no_mercy && k == opt.flanking_k_list.front()) args.push_back("--need_mercy");
       core(args, "Build graph for k = " + number(k));
     });
   }
@@ -717,7 +776,7 @@ class Driver {
     });
   }
   void seed(int source_k, const std::string &source) {
-    int k = opt.k_min; std::string output = graph(k);
+    int k = opt.flanking_k_list.front(); std::string output = graph(k);
     checkpoint("seed-from-k" + number(source_k), {output + ".sdbg_info"}, [&]() {
       Args args{"seq2sdbg"}; auto common = graph_options(k, output, source_k);
       args.insert(args.end(), common.begin(), common.end());
@@ -751,7 +810,7 @@ class Driver {
         });
       };
       for (const auto &name : entries(contig_dir())) {
-        for (int assembled_k : opt.k_list) {
+        for (int assembled_k : ((flanking || opt.reduction_k_list.empty()) ? opt.flanking_k_list : opt.reduction_k_list)) {
           if (assembled_k <= k && name == "k" + number(assembled_k) + ".final.contigs.fa")
             append(contig_dir() + "/" + name);
         }
@@ -795,21 +854,25 @@ class Driver {
       log("Assembly already completed: " + final_path()); return 0;
     }
     library(); merge_reads();
-    log("k list: " + Json(opt.k_list).dump());
+    if (opt.legacy_k_list) log("Shared k list (legacy): " + Json(opt.k_list).dump());
+    log("Reduction k list: " + Json(opt.reduction_k_list).dump());
+    log("Flanking k list: " + Json(opt.flanking_k_list).dump());
+    if (opt.flanking_consensus_only)
+      log("Flanking consensus-only mode: retained contigs and consensus; no iterative read-derived edges");
     try {
-      std::vector<int> reduction;
-      for (int k : opt.k_list) if (k <= 60) reduction.push_back(k);
+      const auto &reduction = opt.reduction_k_list;
+      int first = initial_k();
       bool first_built = opt.kmin_1pass && reduction.empty();
       if (first_built) {
-        std::string output = graph(opt.k_min);
+        std::string output = graph(first);
         checkpoint("first-one-pass", {output + ".sdbg_info"}, [&]() {
-          Args args{"read2sdbg", "-k", number(opt.k_min), "-m", number(opt.min_count),
+          Args args{"read2sdbg", "-k", number(first), "-m", number(opt.min_count),
                     "--host_mem", number(host_mem), "--mem_flag", number(opt.mem_flag),
                     "--output_prefix", output, "--num_cpu_threads", number(opt.num_cpu_threads), "--read_lib_file", lib()};
           if (!opt.no_mercy) args.push_back("--need_mercy");
           core(args, "Build first graph in one pass");
         });
-      } else count(opt.k_min, true);
+      } else count(first, true);
       for (size_t i = 1; i < reduction.size(); ++i) {
         int from = reduction[i - 1], to = reduction[i];
         count(to, false);
@@ -835,19 +898,20 @@ class Driver {
           graph_edges(current, current_edges(current), output, "handoff-graph-k" + number(current));
           assemble(current, output);
         }
-        if (!opt.no_local) local(current, opt.k_min);
+        if (!opt.no_local) local(current, opt.flanking_k_list.front());
         std::string source = contig(current); int source_k = current;
         flanking = true; mkdirs(contig_dir());
-        log("Restarting consensus flanking assembly at k = " + number(opt.k_min) + " from k = " + number(source_k));
-        seed(source_k, source); current = opt.k_min; assemble(current, graph(current));
+        log("Restarting consensus flanking assembly at k = " + number(opt.flanking_k_list.front()) + " from k = " + number(source_k));
+        seed(source_k, source); current = opt.flanking_k_list.front(); assemble(current, graph(current));
       } else {
-        current = opt.k_min;
+        current = first;
         if (!first_built) graph_sequences(current, 0);
         assemble(current, graph(current));
       }
-      for (int next : opt.k_list) if (next > current) {
+      for (int next : opt.flanking_k_list) if (next > current) {
         if (!opt.no_local) local(current, next);
-        iterate(current, next); graph_sequences(next, current); assemble(next, graph(next)); current = next;
+        if (!opt.flanking_consensus_only) iterate(current, next);
+        graph_sequences(next, current); assemble(next, graph(next)); current = next;
       }
       merge_final(current);
     } catch (const EarlyTerminate &early) { merge_final(early.k); }

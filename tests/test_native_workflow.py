@@ -62,10 +62,11 @@ class NativeWorkflowTest(unittest.TestCase):
                               env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, check=check, timeout=120)
 
-    def assemble(self, label, extra=(), binary=None, reads=None, keep=True):
+    def assemble(self, label, extra=(), binary=None, reads=None, keep=True, k_list='21,39,59,79'):
         output = self.root / label
         inputs = reads or ['-1', self.first, '-2', self.second]
-        self.invoke(inputs + (['--keep-tmp-files'] if keep else []) + ['--merge-pairs', '--k-list', '21,39,59,79',
+        self.invoke(inputs + (['--keep-tmp-files'] if keep else []) +
+                    (['--k-list', k_list] if k_list else []) + ['--merge-pairs',
                               '--min-contig-len', '80', '-t', '2', '-m', '200000000',
                               '-o', output] + list(extra), binary=binary)
         return output
@@ -99,6 +100,7 @@ class NativeWorkflowTest(unittest.TestCase):
         self.assertEqual(options['workflow_driver'], 'native-cpp-v1')
         self.assertEqual(options['merge_dedup'], 'sort')
         self.assertEqual(options['merge_sort_memory'], 128)
+        self.assertFalse(options['flanking_consensus_only'])
         expected = [sequence for pair in zip(self.left, self.right) for _, sequence in pair]
         self.assertEqual(binary_sequences(output / 'tmp/reads.lib.bin'), expected)
         merged = fasta(output / 'tmp/flash/library.0.merged.fa.gz')
@@ -175,6 +177,9 @@ class NativeWorkflowTest(unittest.TestCase):
         self.invoke(['--continue', '-o', output])
         self.assertEqual(json.loads(options_path.read_text())['merge_dedup'], 'bloom')
         del options['merge_dedup']
+        for key in ('reduction_k_list', 'flanking_k_list', 'legacy_k_list',
+                    'reduction_k_list_set', 'flanking_k_list_set'):
+            options.pop(key, None)
         options_path.write_text(json.dumps(options))
         final = output / 'final.contigs.fa'
         before = final.read_bytes()
@@ -183,6 +188,74 @@ class NativeWorkflowTest(unittest.TestCase):
         self.invoke(['--continue', '-o', output])
         self.assertEqual(json.loads(options_path.read_text())['merge_dedup'], 'bloom')
         self.assertEqual(final.read_bytes(), before)
+
+    def test_default_phase_k_lists_and_resume(self):
+        output = self.assemble('default phase lists', k_list=None)
+        options = json.loads((output / 'options.json').read_text())
+        self.assertEqual(options['reduction_k_list'], [21, 29, 39, 59])
+        self.assertEqual(options['flanking_k_list'], [21, 31, 41, 61, 81, 101, 141])
+        log = (output / 'log').read_text()
+        self.assertIn('Reduction k list: [21,29,39,59]', log)
+        self.assertIn('Flanking k list: [21,31,41,61,81,101,141]', log)
+        final = output / 'final.contigs.fa'
+        before = final.read_bytes()
+        final.unlink()
+        (output / 'done').unlink()
+        self.invoke(['--continue', '-o', output])
+        self.assertEqual(final.read_bytes(), before)
+
+    def test_consensus_only_flanking_retains_backbone_and_ignores_stale_read_edges(self):
+        output = self.assemble('consensus only flanking', k_list=None,
+                               extra=['--flanking-consensus-only'])
+        options = json.loads((output / 'options.json').read_text())
+        self.assertTrue(options['flanking_consensus_only'])
+        def verify_commands():
+            commands = [json.loads(line[line.index('["--core"'):])
+                        for line in (output / 'log').read_text().splitlines()
+                        if 'command ' in line and '["--core"' in line]
+            self.assertFalse(any(args[1] == 'iterate' for args in commands))
+            graphs = [args for args in commands if args[1] == 'seq2sdbg'
+                      and '/flanking/' in args[args.index('--output_prefix') + 1]]
+            self.assertGreaterEqual(len(graphs), 2)
+            for args in graphs:
+                self.assertNotIn('--input_prefix', args)
+                self.assertIn('--contig', args)
+                self.assertIn('--local_contig', args)
+            self.assertTrue(any(args[args.index('-k') + 1] == '141' for args in graphs))
+        verify_commands()
+        self.assertFalse(list((output / 'tmp/flanking').rglob('*.edges.*')))
+        # A restarted graph must not pick up old iterative edges even if present.
+        prefix = output / 'tmp/flanking/k31/31'
+        Path(str(prefix) + '.edges.0').write_bytes(b'not valid read-derived edges')
+        Path(str(prefix) + '.edges.info').write_text('not valid edge metadata')
+        Path(str(prefix) + '.sdbg_info').unlink()
+        (output / 'done').unlink()
+        self.invoke(['--continue', '-o', output])
+        self.assertTrue(json.loads((output / 'options.json').read_text())['flanking_consensus_only'])
+        verify_commands()
+        self.assertTrue(fasta(output / 'final.contigs.fa'))
+
+    def test_independent_phase_lists_and_different_starting_k(self):
+        output = self.assemble('independent phase lists', extra=[
+            '--reduction-k-list', '23,33,53', '--flanking-k-list', '31,41,61,81'])
+        options = json.loads((output / 'options.json').read_text())
+        self.assertEqual(options['reduction_k_list'], [23, 33, 53])
+        self.assertEqual(options['flanking_k_list'], [31, 41, 61, 81])
+        log = (output / 'log').read_text()
+        self.assertIn('Reduce edges for k = 23 using k = 33', log)
+        self.assertIn('Restarting consensus flanking assembly at k = 31 from k = 53', log)
+        self.assertTrue((output / 'tmp/k23/23.edges.info').exists())
+        self.assertTrue((output / 'tmp/flanking/k31/31.sdbg_info').exists())
+        self.assertFalse((output / 'tmp/k21').exists())
+
+    def test_phase_override_is_independent_of_shared_option_order(self):
+        for index, args in enumerate([
+                ['--reduction-k-list', '23,33,53', '--k-list', '21,39,59,79'],
+                ['--k-list', '21,39,59,79', '--flanking-k-list', '31,41,61']]):
+            output = self.assemble('phase override order ' + str(index), extra=args, k_list=None)
+            options = json.loads((output / 'options.json').read_text())
+            self.assertEqual(options['reduction_k_list'], [23, 33, 53] if index == 0 else [21, 39, 59])
+            self.assertEqual(options['flanking_k_list'], [21, 39, 59, 79] if index == 0 else [31, 41, 61])
 
     def test_reduction_keeps_counted_edges_without_preliminary_graphs(self):
         output = self.assemble('edges-only reduction', extra=['-t', '1'])
@@ -282,7 +355,10 @@ class NativeWorkflowTest(unittest.TestCase):
     def test_rejects_legacy_checkpoints_and_bad_options(self):
         for options in [['--k-step', '0'], ['--k-list', '21,21'], ['--flash-min-overlap', '0'],
                         ['--merge-index', 'invalid'], ['--merge-dedup', 'invalid'],
-                        ['--merge-sort-memory', '0']]:
+                        ['--merge-sort-memory', '0'], ['--reduction-k-list', '21,61'],
+                        ['--flanking-k-list', '21,63'], ['--flanking-k-list', '21,31,31'],
+                        ['--flanking-k-list', '31,21'], ['--reduction-k-list', '22'],
+                        ['--flanking-k-list', ',']]:
             result = self.invoke(['-r', self.first, '-o', self.root / ('bad-' + options[0][2:])] + options, check=False)
             self.assertNotEqual(result.returncode, 0)
         legacy = self.root / 'legacy'
