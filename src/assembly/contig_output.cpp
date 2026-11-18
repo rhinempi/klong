@@ -71,13 +71,13 @@ void OutputContigs(UnitigGraph &graph, ContigWriter *contig_writer,
 #pragma omp parallel for
   for (UnitigGraph::size_type i = 0; i < graph.size(); ++i) {
     auto adapter = graph.MakeVertexAdapter(i);
+    if (change_only && !adapter.IsChanged()) {
+      continue;
+    }
     double multi = change_only ? 1
                                : std::min(static_cast<double>(kMaxMul),
                                           adapter.GetAvgDepth());
     std::string ascii_contig = graph.VertexToDNAString(adapter);
-    if (change_only && !adapter.IsChanged()) {
-      continue;
-    }
 
     if (adapter.IsLoop()) {
       int flag = contig_flag::kLoop | contig_flag::kStandalone;

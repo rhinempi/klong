@@ -20,6 +20,7 @@
 /* contact: Dinghua Li <dhli@cs.hku.hk> */
 
 #include "sdbg_pruning.h"
+#include <omp.h>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -35,12 +36,20 @@ namespace sdbg_pruning {
 
 double InferMinDepth(SDBG &dbg) {
   Histgram<mul_t> hist;
-
-#pragma omp parallel for
-  for (uint64_t i = 0; i < dbg.size(); ++i) {
-    if (dbg.IsValidEdge(i)) {
-      hist.insert(dbg.EdgeMultiplicity(i));
+  std::vector<std::vector<size_t>> local_counts(
+      omp_get_max_threads(), std::vector<size_t>(kMaxMul + 1, 0));
+#pragma omp parallel
+  {
+    auto &counts = local_counts[omp_get_thread_num()];
+#pragma omp for
+    for (uint64_t i = 0; i < dbg.size(); ++i) {
+      if (dbg.IsValidEdge(i)) ++counts[dbg.EdgeMultiplicity(i)];
     }
+  }
+  for (int value = 0; value <= kMaxMul; ++value) {
+    size_t count = 0;
+    for (const auto &counts : local_counts) count += counts[value];
+    if (count) hist.insert(static_cast<mul_t>(value), count);
   }
 
   double cov = hist.FirstLocalMinimum();

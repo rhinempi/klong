@@ -112,6 +112,6 @@ uint32_t RemoveLowDepth(UnitigGraph &graph, double min_depth) {
       num_removed += success;
     }
   }
-  graph.Refresh(false);
+  if (num_removed) graph.Refresh(false);
   return num_removed;
 }

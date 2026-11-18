@@ -32,6 +32,6 @@ uint32_t DisconnectWeakLinks(UnitigGraph &graph, double local_ratio = 0.1) {
       }
     }
   }
-  graph.Refresh(false);
+  if (num_disconnected) graph.Refresh(false);
   return num_disconnected;
 }

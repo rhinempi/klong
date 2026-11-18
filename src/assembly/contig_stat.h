@@ -6,6 +6,8 @@
 #define MEGAHIT_CONTIG_STAT_H
 
 #include <map>
+#include <omp.h>
+#include <vector>
 #include "unitig_graph.h"
 #include "utils/histgram.h"
 #include "utils/utils.h"
@@ -16,17 +18,25 @@ inline ContigStat CalcAndPrintStat(UnitigGraph &graph, bool print = true,
                                    bool changed_only = false) {
   uint32_t n_isolated = 0, n_looped = 0;
   Histgram<uint64_t> hist;
-#pragma omp parallel for reduction(+ : n_looped, n_isolated)
-  for (UnitigGraph::size_type i = 0; i < graph.size(); ++i) {
-    auto adapter = graph.MakeVertexAdapter(i);
-    if (changed_only && !adapter.IsChanged()) {
-      continue;
+  std::vector<std::map<uint64_t, size_t>> local_counts(omp_get_max_threads());
+#pragma omp parallel reduction(+ : n_looped, n_isolated)
+  {
+    std::map<uint64_t, size_t> counts;
+#pragma omp for
+    for (UnitigGraph::size_type i = 0; i < graph.size(); ++i) {
+      auto adapter = graph.MakeVertexAdapter(i);
+      if (changed_only && !adapter.IsChanged()) {
+        continue;
+      }
+      ++counts[adapter.GetLength() + graph.k()];
+      n_looped += adapter.IsLoop();
+      n_isolated += adapter.IsStandalone() || (graph.InDegree(adapter) == 0 &&
+                                               graph.OutDegree(adapter) == 0);
     }
-    hist.insert(adapter.GetLength() + graph.k());
-    n_looped += adapter.IsLoop();
-    n_isolated += adapter.IsStandalone() || (graph.InDegree(adapter) == 0 &&
-                                             graph.OutDegree(adapter) == 0);
+    local_counts[omp_get_thread_num()].swap(counts);
   }
+  for (const auto &counts : local_counts)
+    for (const auto &entry : counts) hist.insert(entry.first, entry.second);
   uint64_t total_size = hist.sum();
   ContigStat stat = {{"Max", hist.maximum()},
                      {"Min", hist.minimum()},

@@ -147,7 +147,7 @@ size_t BaseBubbleRemover::PopBubbles(UnitigGraph &graph, bool permanent_rm,
       num_removed += SearchAndPopBubble(graph, adapter, max_len, checker);
     }
   }
-  graph.Refresh(!permanent_rm);
+  if (num_removed) graph.Refresh(!permanent_rm);
   return num_removed;
 }
 

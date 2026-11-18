@@ -144,7 +144,7 @@ int main_assemble(int argc, char **argv) {
     opt.max_tip_len = dbg.k() * 2;
   }
   // set min depth
-  if (opt.min_depth <= 0) {
+  if (opt.prune_level >= 1 && opt.min_depth <= 0) {
     opt.min_depth = sdbg_pruning::InferMinDepth(dbg);
     xinfo("min depth set to {.3}\n", opt.min_depth);
   }
