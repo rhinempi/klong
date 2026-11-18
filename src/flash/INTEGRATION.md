@@ -9,10 +9,13 @@ to `main_flash` and links it into `megahit_core`. Run
 `megahit_core flash --help` for the original FLASH command-line interface.
 No separate FLASH executable or network access is required at runtime.
 
-The Python launcher's `merge_paired_reads()` function runs FLASH as a separate
-export after binary library construction when `--merge-pairs` is supplied.
-It never changes input library paths or adds merged reads to `reads.lib.bin`.
-Assembly uses all original reads, with the original pairing and binary format.
+The native workflow runs FLASH before binary-library construction, enabled by
+default for paired FASTQ (`--merge-pairs` is accepted explicitly). Successfully
+merged sequences and both unmerged mate outputs enter `reads.lib.bin` as
+single-end libraries. Original mates of merged pairs are not added again.
+Use `--no-merge-pairs` for the previous original-mate workflow. The binary format
+is unchanged. The historical Python driver remains a regression reference;
+production workflow behavior is documented in [native details](../../docs/native-executable.md).
 Separate and interleaved paired FASTQ
 inputs are supported, including gzip and bzip2 compression. Paired FASTA
 inputs are not supported in this mode because FLASH requires qualities.
@@ -24,7 +27,9 @@ hard upper limit on accepted overlaps. FLASH uses `-t` from the launcher;
 with multiple threads output order may vary, but mates remain associated.
 
 Each paired library produces `OUT_DIR/tmp/flash/library.N.merged.fa.gz`,
-containing only successfully merged sequences in gzip-compressed FASTA.
+containing successfully merged sequences, plus `library.N.unmerged.1.fa.gz` and
+`library.N.unmerged.2.fa.gz`. All are gzip FASTA. Nonempty exports are listed in
+`assembly_inputs.json` and used by both binary-library creation and consensus.
 Conversion streams validated FASTA records to bundled `pigz -1 -c -n -p NUM_THREADS`
 when the optional compressor was built and `-t` is greater than one. Compression is parallel;
 FASTQ parsing/FASTA formatting remains a single streaming producer, with
@@ -43,14 +48,15 @@ by interleaved inputs. A library with no mergeable pairs produces a valid
 empty gzip file. Single-end inputs are not included in the merged export.
 
 The output location remains under `OUT_DIR/tmp`, even with `--tmp-dir`.
-Merged FASTA and the atomic `merged.json` completion manifest survive normal
+FASTA exports and the atomic `merged.json`/`assembly_inputs.json` manifests survive normal
 temporary-file cleanup; intermediate FLASH FASTQ files are removed.
-Resume reuses completed exports or regenerates missing exports independently
-of assembly checkpoints. No assembly checkpoint numbers are changed.
+Native resume reuses completed exports or regenerates missing exports. A new
+preprocessing checkpoint invalidates older binary libraries and downstream stages
+on incomplete FLASH-enabled runs, so original mates cannot be silently reused.
 
 With merged export enabled, the [Minimap2 stage](../minimap2/INTEGRATION.md)
-maps these files against extracted 290-base contig ends at every flanking
-transition. Mapping preserves original reads and writes per-current-k SAM
+maps both merged and unmerged exports against extracted 290-base contig ends at every flanking
+transition. Mapping writes per-current-k SAM
 files, e.g. `OUT_DIR/tmp/k59/flank_mapping`. Outward consensus extensions replace
 the former IDBA local-contig graph inputs. The same merged library is reused
 across phases rather than merged again at each k.

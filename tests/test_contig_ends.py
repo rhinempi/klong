@@ -28,7 +28,7 @@ class ContigEndExtractionTest(unittest.TestCase):
         return list(zip(lines[::2], lines[1::2]))
 
     def test_threshold_and_exact_end_sequences(self):
-        for length in [1, 289, 290, 579, 580, 581, 1000]:
+        for length in [1, 289, 290, 291, 579, 580, 581, 1000]:
             with self.subTest(length=length):
                 seq = self.sequence(length)
                 header = '>k59_42 flag=0 multi=12 len={}'.format(length)

@@ -11,6 +11,7 @@
 
 #include "sequence/io/fastx_reader.h"
 #include "sequence/sequence_package.h"
+#include "sdbg/sdbg_def.h"
 
 namespace {
 using Counts = std::array<uint64_t, 4>;
@@ -20,6 +21,7 @@ struct Reference {
   std::string sequence;
   std::vector<Counts> left, right;
   uint64_t primary_reads{0};
+  uint64_t secondary_reads{0};
   uint64_t overhang_reads{0};
   bool extend_left{true};
   bool extend_right{true};
@@ -101,6 +103,8 @@ void ProcessSam(const std::string &path, std::vector<Reference> *references,
   std::ifstream source(path);
   if (!source) throw std::runtime_error("Cannot open SAM: " + path);
   SeqPackage packed_read;
+  std::string current_read;
+  std::vector<size_t> voted_references;
   std::string line;
   uint64_t line_number = 0;
   while (std::getline(source, line)) {
@@ -124,12 +128,18 @@ void ProcessSam(const std::string &path, std::vector<Reference> *references,
         continue;
       }
       if (fields.size() < 11) throw std::runtime_error("SAM requires at least 11 fields");
+      // Minimap2 groups a query's alignments; retain only that query's voted ends.
+      if (fields[0] != current_read) {
+        current_read = fields[0];
+        voted_references.clear();
+      }
       uint64_t flag = Number(fields[1]);
       if (flag & (4 | 256 | 2048)) continue;
       auto entry = index.find(fields[2]);
       if (entry == index.end()) throw std::runtime_error("Unknown SAM reference: " + fields[2]);
       auto &ref = (*references)[entry->second];
       ++ref.primary_reads;
+      if (std::find(voted_references.begin(), voted_references.end(), entry->second) != voted_references.end()) continue;
       if (fields[9] == "*") continue;
       uint64_t position = Number(fields[3]);
       if (position == 0 || position > ref.sequence.size()) throw std::runtime_error("SAM POS outside reference");
@@ -192,7 +202,10 @@ void ProcessSam(const std::string &path, std::vector<Reference> *references,
           rpos += op.length;
         }
       }
-      ref.overhang_reads += voted;
+      if (voted) {
+        ++ref.overhang_reads;
+        voted_references.push_back(entry->second);
+      }
     } catch (const std::exception &error) {
       throw std::runtime_error(path + ":" + std::to_string(line_number) + ": " + error.what());
     }
@@ -222,16 +235,19 @@ int main_contig_end_consensus(int argc, char **argv) {
     for (int i = 4; i < argc; ++i) ProcessSam(argv[i], &references, index);
     std::ofstream output(argv[2]), stats(argv[3]), info(std::string(argv[2]) + ".info");
     if (!output || !stats || !info) throw std::runtime_error("Cannot open consensus output files");
-    stats << "reference\treference_length\tleft_added\tright_added\tprimary_reads\toverhang_reads\n";
+    stats << "reference\treference_length\tleft_added\tright_added\tprimary_reads\toverhang_reads\tsecondary_reads\n";
     uint64_t extended = 0, added = 0, output_bases = 0;
     for (const auto &ref : references) {
       auto left = Consensus(ref.left), right = Consensus(ref.right);
       std::reverse(left.begin(), left.end());
       stats << ref.name << '\t' << ref.sequence.size() << '\t' << left.size() << '\t'
-            << right.size() << '\t' << ref.primary_reads << '\t' << ref.overhang_reads << '\n';
+            << right.size() << '\t' << ref.primary_reads << '\t' << ref.overhang_reads
+            << '\t' << ref.secondary_reads << '\n';
       if (left.empty() && right.empty()) continue;
       auto length = left.size() + ref.sequence.size() + right.size();
-      output << '>' << ref.name << " flag=0 multi=1 reference_length=" << ref.sequence.size()
+      auto multiplicity = std::min(ref.overhang_reads, static_cast<uint64_t>(kMaxMul));
+      output << '>' << ref.name << " flag=0 multi=" << multiplicity
+             << " support_reads=" << ref.overhang_reads << " reference_length=" << ref.sequence.size()
              << " left_extension=" << left.size() << " right_extension=" << right.size()
              << " len=" << length << '\n' << left << ref.sequence << right << '\n';
       ++extended;

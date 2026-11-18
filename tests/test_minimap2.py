@@ -50,7 +50,8 @@ class Minimap2IntegrationTest(unittest.TestCase):
         metadata = json.loads(self.manifest.read_text())
         config = metadata['configuration']
         self.assertEqual(config['version'], '2.31-r1302')
-        self.assertEqual(config['parameters'], ['-x', 'sr', '-a', '-Y', '-t', '2', '-I', '55G'])
+        self.assertEqual(config['parameters'], ['-x', 'sr', '-a', '-Y', '--secondary=no',
+                                                 '-t', '2', '-I', '55G'])
         self.assertEqual(config['reference']['path'], str(self.reference))
         lines = self.sam.read_text().splitlines()
         self.assertTrue(any(line.startswith('@SQ\tSN:reference\tLN:2000') for line in lines))
@@ -61,6 +62,37 @@ class Minimap2IntegrationTest(unittest.TestCase):
         self.assertEqual(mapped[0][5], '250M')
         self.assertTrue(any(r[0] == 'unmapped' and int(r[1]) & 4 for r in records))
         self.assertFalse((self.output_dir / 'library.0.sam.tmp').exists())
+
+    def test_primary_alignment_only_extends_one_of_identical_contig_ends(self):
+        sequence, tail = self.sequence[:290], self.sequence[600:640]
+        self.reference.write_text('>first|end\n' + sequence + '\n>second|end\n' + sequence + '\n')
+        with gzip.open(self.query, 'wt') as dest:
+            dest.write('>ambiguous\n' + sequence + tail + '\n')
+        self.launcher.map_merged_reads(59)
+        records = [line.split('\t') for line in self.sam.read_text().splitlines()
+                   if not line.startswith('@')]
+        mapped = [row for row in records if not int(row[1]) & (4 | 2048)]
+        self.assertEqual(len(mapped), 1)
+        self.assertIn(mapped[0][2], {'first|end', 'second|end'})
+        self.assertFalse(any(int(row[1]) & 256 for row in mapped))
+        self.assertTrue(all(row[9] == sequence + tail and 'S' in row[5] for row in mapped))
+        extended = Path(self.launcher.extend_contig_ends(59))
+        lines = extended.read_text().splitlines()
+        self.assertEqual({header[1:].split()[0]: seq for header, seq in zip(lines[::2], lines[1::2])},
+                         {mapped[0][2]: sequence + tail})
+        self.assertTrue(all(' multi=1 support_reads=1 ' in header for header in lines[::2]))
+
+    def test_resume_invalidates_secondary_enabled_mapping(self):
+        self.launcher.map_merged_reads(59)
+        state = json.loads(self.manifest.read_text())
+        state['configuration']['parameters'] = [param for param in state['configuration']['parameters']
+                                                 if param != '--secondary=no'] + ['--secondary=yes', '--secondary-seq']
+        self.manifest.write_text(json.dumps(state))
+        self.sam.write_text('old secondary-enabled mapping')
+        self.launcher.check_point._logged_checkpoint = 100
+        self.launcher.map_merged_reads(59)
+        self.assertIn('--secondary=no', json.loads(self.manifest.read_text())['configuration']['parameters'])
+        self.assertTrue(self.sam.read_text().startswith('@'))
 
     def test_multiple_libraries_are_mapped_separately(self):
         self.merged_manifest.write_text(json.dumps([str(self.query)] * 2))

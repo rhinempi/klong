@@ -55,6 +55,9 @@ class NativeConsensusTest(unittest.TestCase):
         with self.stats.open() as source:
             stats = list(csv.DictReader(source, delimiter='\t'))[0]
         self.assertEqual(stats['primary_reads'], '9')
+        self.assertEqual(stats['overhang_reads'], '9')
+        self.assertEqual(stats['secondary_reads'], '0')
+        self.assertIn(' flag=0 multi=9 support_reads=9 ', self.output.read_text())
         self.assertEqual(stats['right_added'], '1')
 
     def test_left_and_right_consensus_orientation(self):
@@ -89,9 +92,47 @@ class NativeConsensusTest(unittest.TestCase):
 
     def test_secondary_supplementary_and_unmapped_do_not_vote(self):
         rows = [sam_record('primary', 'ACGTA', '4M1S')]
-        rows += [sam_record(str(flag), 'ACGTG', '4M1S', flag=flag) for flag in [4, 256, 2048]]
+        rows += [sam_record(str(flag), 'ACGTG', '4M1S', flag=flag) for flag in [4, 256, 2048, 2304]]
         self.run_engine(rows)
         self.assertEqual(fasta_sequences(self.output)['ref'], 'ACGTA')
+
+    def test_one_read_only_extends_its_primary_contig_end(self):
+        rows = [sam_record('read', 'ACGTA', '4M1S', reference='first|end'),
+                sam_record('read', 'ACGTA', '4M1S', reference='second|end', flag=256)]
+        self.run_engine(rows, {'first|end': 'ACGT', 'second|end': 'ACGT'})
+        self.assertEqual(fasta_sequences(self.output), {'first|end': 'ACGTA'})
+        headers = self.output.read_text().splitlines()[::2]
+        self.assertTrue(all(' multi=1 support_reads=1 ' in header for header in headers))
+        with self.stats.open() as source:
+            stats = {row['reference']: row for row in csv.DictReader(source, delimiter='\t')}
+        self.assertEqual(stats['second|end']['primary_reads'], '0')
+        self.assertEqual(stats['second|end']['secondary_reads'], '0')
+        self.assertEqual(stats['second|end']['overhang_reads'], '0')
+
+    def test_same_query_does_not_vote_twice_for_same_end(self):
+        rows = [sam_record('same', 'ACGTA', '4M1S'),
+                sam_record('same', 'ACGTG', '4M1S'),
+                sam_record('same', 'ACGTG', '4M1S', flag=256),
+                sam_record('other', 'ACGTA', '4M1S')]
+        self.run_engine(rows)
+        self.assertEqual(fasta_sequences(self.output)['ref'], 'ACGTA')
+        self.assertIn(' multi=2 support_reads=2 ', self.output.read_text())
+
+    def test_primary_reverse_read_and_non_overhang_counts(self):
+        self.run_engine([sam_record('inside', 'ACGT', '4M'),
+                         sam_record('reverse', 'ACGTA', '4M1S', flag=16),
+                         sam_record('secondary', 'ACGTG', '4M1S', flag=272)])
+        self.assertEqual(fasta_sequences(self.output)['ref'], 'ACGTA')
+        self.assertIn(' multi=1 support_reads=1 ', self.output.read_text())
+
+    def test_same_name_in_separate_libraries_counts_as_distinct_reads(self):
+        self.run_engine([sam_record('same', 'ACGTA', '4M1S')],
+                        extra_sams=[[sam_record('same', 'ACGTA', '4M1S')]])
+        self.assertIn(' multi=2 support_reads=2 ', self.output.read_text())
+
+    def test_multiplicity_saturates_at_binary_edge_limit(self):
+        self.run_engine([sam_record(str(i), 'ACGTA', '4M1S') for i in range(65536)])
+        self.assertIn(' multi=65535 support_reads=65536 ', self.output.read_text())
 
     def test_tie_stops_extension_at_that_position(self):
         self.run_engine([sam_record('a', 'ACGTAG', '4M2S'), sam_record('b', 'ACGTAT', '4M2S')])
@@ -251,7 +292,8 @@ class ConsensusWorkflowTest(unittest.TestCase):
         sequence = ''.join(rng.choice('ACGT') for _ in range(300))
         self.reference.write_text('>ref\n' + sequence + '\n')
         self.sam.write_text('@SQ\tSN:ref\tLN:300\n' +
-                            sam_record('r', sequence[-50:] + 'A', '50M1S', position=251))
+                            ''.join(sam_record('r' + str(i), sequence[-50:] + 'A', '50M1S', position=251)
+                                    for i in range(5)))
         (self.mapping / 'mapping.json').write_text(json.dumps({
             'configuration': {'reference': self.launcher.file_signature(str(self.reference))},
             'outputs': [str(self.sam)]}))
@@ -279,6 +321,9 @@ class ConsensusWorkflowTest(unittest.TestCase):
         expected = sequence + 'A'
         reverse = expected.translate(str.maketrans('ACGT', 'TGCA'))[::-1]
         self.assertTrue(expected in sequences or reverse in sequences)
+        headers = Path(str(assembled) + '.contigs.fa').read_text().splitlines()[::2]
+        self.assertTrue(headers)
+        self.assertTrue(all(' multi=5.0000 ' in header for header in headers))
 
     def test_no_local_excludes_existing_local_file_from_graph_command(self):
         self.opt.no_local = True

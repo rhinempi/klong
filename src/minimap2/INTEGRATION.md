@@ -14,9 +14,10 @@ bundled NEON compatibility header (line endings normalized to LF).
 Run `megahit_core minimap2 --version` or `megahit_core minimap2 --help` for
 the bundled aligner's standalone command interface.
 
-When `--merge-pairs` is enabled, `map_merged_reads(cur_k)` runs inside the new
-consensus local stage before every flanking transition: k59 for 59->79, k79 for
-79->99, and so on. Workflows starting above k60 use the same local stage for
+FLASH preprocessing is enabled by default for paired FASTQ. Mapping runs inside
+the native consensus stage at the reduction/flanking handoff (by default k59
+to k21) and before every later transition in the configured flanking list.
+Workflows starting above k60 use the same local stage for
 their transitions. The legacy IDBA local command is no longer invoked by the
 launcher. `--no-local` disables publication and use of local-contig graph
 inputs; the optional reduction-handoff export remains available separately.
@@ -25,10 +26,11 @@ The reference is `OUT_DIR/tmp/k59/k59.contig_ends.fa`, extracted from the final
 k59 reduction-phase assembly before mapping. It contains 290-base end fragments
 or intact original contigs shorter than 580 bases, not final flanking assembly
 contigs or bubble sequences.
-Each merged gzip FASTA library is mapped independently as single-end reads:
+Each nonempty merged or unmerged gzip FASTA export in `assembly_inputs.json`
+is mapped independently as single-end reads. For example:
 
 ```sh
-megahit_core minimap2 -x sr -a -Y -t NUM_CPU_THREADS -I 55G \
+megahit_core minimap2 -x sr -a -Y --secondary=no -t NUM_CPU_THREADS -I 55G \
   -o OUT_DIR/tmp/k59/flank_mapping/library.N.sam.tmp \
   OUT_DIR/tmp/k59/k59.contig_ends.fa \
   OUT_DIR/tmp/flash/library.N.merged.fa.gz
@@ -39,12 +41,14 @@ must finish before `mapping.json` is published. That file records version,
 parameters, input signatures, and output paths for resume. Changed inputs or
 missing outputs trigger regeneration without changing assembly checkpoints.
 No-reference/empty-reference assemblies are reported; an empty reference is
-skipped. Empty merged libraries produce header-only SAM files.
+skipped. Empty FLASH exports are omitted from the mapping input list.
 
 Alignment output always lives under `OUT_DIR/tmp/k59/flank_mapping`, including
 when `--tmp-dir` points elsewhere, and survives normal temporary-file cleanup.
 The alignments now feed the [native outward consensus step](../../docs/contig-end-consensus.md).
-Neither mapping nor consensus replaces the original binary read library.
+Before assembly, the binary library is built from the same merged/unmerged
+FLASH exports as single-end inputs, plus any explicit `-r` libraries. Mapping
+and consensus do not rewrite that binary library.
 Consensus now supplies the standard `k*.local.fa` graph input, replacing the
 old local-assembly sequences; exact iterative-edge extraction is unchanged.
 The `55G` argument is Minimap2's

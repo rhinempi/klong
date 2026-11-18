@@ -1029,7 +1029,8 @@ def map_merged_reads(cur_k):
     output_dir = os.path.join(os.path.dirname(reference), 'flank_mapping')
     os.makedirs(output_dir, exist_ok=True)
     manifest = os.path.join(output_dir, 'mapping.json')
-    parameters = ['-x', 'sr', '-a', '-Y', '-t', str(opt.num_cpu_threads), '-I', '55G']
+    parameters = ['-x', 'sr', '-a', '-Y', '--secondary=no',
+                  '-t', str(opt.num_cpu_threads), '-I', '55G']
 
     configuration = {'version': check_output([opt.megahit_core, 'minimap2', '--version']),
                      'parameters': parameters, 'reference': file_signature(reference),
@@ -1073,7 +1074,7 @@ def extend_contig_ends(cur_k):
     output = os.path.join(os.path.dirname(reference), 'k{}.contig_ends.extended.fa'.format(cur_k))
     stats = os.path.join(output_dir, 'consensus.tsv')
     manifest = os.path.join(output_dir, 'consensus.json')
-    configuration = {'algorithm': 'outward-plurality-extended-only-v2', 'reference': file_signature(reference),
+    configuration = {'algorithm': 'outward-plurality-read-support-primary-580-v7', 'reference': file_signature(reference),
                      'alignments': [file_signature(path) for path in alignments]}
     if check_point._logged_checkpoint is not None and os.path.isfile(manifest):
         with open(manifest) as source:

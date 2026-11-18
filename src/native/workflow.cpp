@@ -63,7 +63,7 @@ struct Options {
   bool test_mode = false, continue_mode = false, force_overwrite = false,
        auto_k = true, set_list_by_min_max_step = false, no_mercy = false,
        no_local = false, keep_tmp_files = false, kmin_1pass = false,
-       debug_assembly = false, merge_pairs = false, verbose = false, hw_accel = true;
+       debug_assembly = false, merge_pairs = true, verbose = false, hw_accel = true;
   std::vector<int> k_list{21, 29, 39, 59, 79, 99, 119, 141};
   std::vector<int> reduction_k_list, flanking_k_list;
   bool legacy_k_list = false;
@@ -88,7 +88,8 @@ Inputs (repeatable, comma-separated; FASTA/FASTQ, plain/gzip/bzip2):
   -1 FILES  -2 FILES            Paired-end libraries
   --12 FILES                   Interleaved paired-end libraries
   -r, --read FILES             Single-end libraries
-  --merge-pairs                Merge FASTQ pairs with bundled FLASH
+  --merge-pairs                Merge paired FASTQ before binary-library creation [on]
+  --no-merge-pairs             Use original mates without FLASH (also for paired FASTA)
   --flash-min-overlap N        Minimum overlap [10]
   --flash-max-overlap N        Overlap scoring length [65]
   --flash-max-mismatch-density X  Mismatch density [0.25]
@@ -209,6 +210,7 @@ Options parse(int argc, char **argv) {
       auto fields = split(value()); if (fields.size() != 2) throw Error("--merge-level requires LENGTH,SIMILARITY");
       opt.merge_len = static_cast<int>(real(fields[0])); opt.merge_similar = real(fields[1]);
     } else if (key == "--merge-pairs") opt.merge_pairs = true;
+    else if (key == "--no-merge-pairs") opt.merge_pairs = false;
     else if (key == "--no-mercy") opt.no_mercy = true;
     else if (key == "--no-local") opt.no_local = true;
     else if (key == "--flanking-consensus-only") opt.flanking_consensus_only = true;
@@ -424,6 +426,7 @@ class Driver {
     }
     validate();
     if (opt.test_mode) {
+      opt.merge_pairs = false;  // The bundled test libraries are FASTA.
       Args candidates{parent(executable) + "/../test_data", parent(executable) + "/../share/megahit/test_data",
                       MEGAHIT_TEST_DATA_DIR};
       std::string data;
@@ -483,11 +486,18 @@ class Driver {
         return converted;
       };
       try {
-        for (size_t i = 0; i < opt.pe12.size(); ++i)
-          descriptor << opt.pe12[i] << "\ninterleaved " << add(opt.pe12[i], "pe12", i) << '\n';
-        for (size_t i = 0; i < opt.pe1.size(); ++i)
-          descriptor << opt.pe1[i] << ',' << opt.pe2[i] << "\npe " << add(opt.pe1[i], "pe1", i) << ' '
-                     << add(opt.pe2[i], "pe2", i) << '\n';
+        if (opt.merge_pairs && (!opt.pe1.empty() || !opt.pe12.empty())) {
+          Args inputs = read_json(opt.out_dir + "/tmp/flash/assembly_inputs.json").get<Args>();
+          if (inputs.empty() && opt.se.empty()) throw Error("FLASH produced no reads for the assembly library");
+          for (size_t i = 0; i < inputs.size(); ++i)
+            descriptor << inputs[i] << "\nse " << add(inputs[i], "flash", i) << '\n';
+        } else {
+          for (size_t i = 0; i < opt.pe12.size(); ++i)
+            descriptor << opt.pe12[i] << "\ninterleaved " << add(opt.pe12[i], "pe12", i) << '\n';
+          for (size_t i = 0; i < opt.pe1.size(); ++i)
+            descriptor << opt.pe1[i] << ',' << opt.pe2[i] << "\npe " << add(opt.pe1[i], "pe1", i) << ' '
+                       << add(opt.pe2[i], "pe2", i) << '\n';
+        }
         for (size_t i = 0; i < opt.se.size(); ++i)
           descriptor << opt.se[i] << "\nse " << add(opt.se[i], "se", i) << '\n';
         atomic_text(lib(), descriptor.str());
@@ -533,15 +543,27 @@ class Driver {
     return pigz;
   }
   void merge_reads() {
-    if (!opt.merge_pairs || (opt.pe1.empty() && opt.pe12.empty())) return;
+    if (!opt.merge_pairs || (opt.pe1.empty() && opt.pe12.empty())) {
+      if (!opt.continue_mode) {
+        remove_file(opt.out_dir + "/tmp/flash/merged.json");
+        remove_file(opt.out_dir + "/tmp/flash/assembly_inputs.json");
+      }
+      return;
+    }
     std::string directory = opt.out_dir + "/tmp/flash"; mkdirs(directory);
     std::string manifest = directory + "/merged.json";
+    std::string assembly_manifest = directory + "/assembly_inputs.json";
     size_t libraries = opt.pe1.size() + opt.pe12.size();
     Args outputs;
     for (size_t i = 0; i < libraries; ++i) outputs.push_back(directory + "/library." + number(i) + ".merged.fa.gz");
-    Args expected = outputs; expected.push_back(manifest);
-    checkpoint("flash-merged-reads", expected, [&]() {
+    Args expected = outputs; expected.push_back(manifest); expected.push_back(assembly_manifest);
+    for (size_t i = 0; i < libraries; ++i)
+      for (int mate = 1; mate <= 2; ++mate)
+        expected.push_back(directory + "/library." + number(i) + ".unmerged." + number(mate) + ".fa.gz");
+    checkpoint("flash-assembly-inputs-v2", expected, [&]() {
       remove_file(manifest);
+      remove_file(assembly_manifest);
+      Args assembly_inputs;
       for (size_t i = 0; i < libraries; ++i) {
         std::string work = temporary_directory(opt.temp_dir + "/flash-");
         try {
@@ -559,16 +581,26 @@ class Driver {
           args.insert(args.end(), inputs.begin(), inputs.end());
           core(args, "Merge paired-end library " + number(i) + " with FLASH", true);
           auto begin = std::chrono::steady_clock::now();
-          convert_fastq(work + "/" + prefix + ".extendedFrags.fastq", outputs[i] + ".tmp",
-                        opt.num_cpu_threads > 1 ? compressor() : "", opt.num_cpu_threads,
-                        [&](const std::string &message) { log(message); });
-          replace(outputs[i] + ".tmp", outputs[i]);
+          auto export_reads = [&](const std::string &source, const std::string &target) {
+            try {
+              convert_fastq(source, target + ".tmp", opt.num_cpu_threads > 1 ? compressor() : "",
+                            opt.num_cpu_threads, [&](const std::string &message) { log(message); });
+              replace(target + ".tmp", target);
+            } catch (...) { remove_file(target + ".tmp"); throw; }
+            // Empty gzip files are valid exports, but not binary-library inputs.
+            if (size(source)) assembly_inputs.push_back(target);
+          };
+          export_reads(work + "/" + prefix + ".extendedFrags.fastq", outputs[i]);
           log("Merged FASTA: " + outputs[i] + " (conversion " + number(std::chrono::duration<double>(
               std::chrono::steady_clock::now() - begin).count()) + " seconds)");
+          for (int mate = 1; mate <= 2; ++mate)
+            export_reads(work + "/" + prefix + ".notCombined_" + number(mate) + ".fastq",
+                         directory + "/" + prefix + ".unmerged." + number(mate) + ".fa.gz");
           remove_tree(work);
         } catch (...) { remove_file(outputs[i] + ".tmp"); remove_tree(work); throw; }
       }
       atomic_json(manifest, outputs);
+      atomic_json(assembly_manifest, assembly_inputs);
     });
   }
   void count(int k, bool first) {
@@ -724,18 +756,19 @@ class Driver {
   }
   void local(int k, int to) {
     std::string output = contig(k) + ".local.fa";
-    checkpoint("consensus-local-k" + number(k) + "-k" + number(to), {output, output + ".info"}, [&]() {
+    checkpoint("consensus-local-read-support-primary-580-all-flash-v8-k" + number(k) + "-k" + number(to), {output, output + ".info"}, [&]() {
       log("Consensus local contigs for k = " + number(k) + " -> " + number(to));
-      std::string manifest = opt.out_dir + "/tmp/flash/merged.json";
+      std::string manifest = opt.out_dir + "/tmp/flash/assembly_inputs.json";
       if (!opt.merge_pairs || !exists(manifest)) {
         atomic_text(output, ""); atomic_text(output + ".info", "0 0\n");
-        log("No merged read libraries; write empty consensus local contigs"); return;
+        log("No FLASH assembly read libraries; write empty consensus local contigs"); return;
       }
       Args queries = read_json(manifest).get<Args>();
       extract_ends(k);
       if (queries.empty() || !size(ends(k))) { atomic_text(output, ""); atomic_text(output + ".info", "0 0\n"); return; }
       std::string mapping = parent(ends(k)) + "/flank_mapping"; mkdirs(mapping);
-      Args params{"-x", "sr", "-a", "-Y", "-t", number(opt.num_cpu_threads), "-I", "55G"};
+      Args params{"-x", "sr", "-a", "-Y", "--secondary=no",
+                  "-t", number(opt.num_cpu_threads), "-I", "55G"};
       Json configuration{{"version", MM_VERSION}, {"parameters", params}, {"reference", signature(ends(k))}};
       configuration["queries"] = Json::array();
       Args alignments;
@@ -754,7 +787,7 @@ class Driver {
         for (size_t i = 0; i < queries.size(); ++i) {
           Args args{"minimap2"}; args.insert(args.end(), params.begin(), params.end());
           args.insert(args.end(), {"-o", alignments[i] + ".tmp", ends(k), queries[i]});
-          try { core(args, "Map merged reads to k = " + number(k) + " contig ends", true); replace(alignments[i] + ".tmp", alignments[i]); }
+          try { core(args, "Map assembly reads to k = " + number(k) + " contig ends", true); replace(alignments[i] + ".tmp", alignments[i]); }
           catch (...) { remove_file(alignments[i] + ".tmp"); throw; }
         }
         atomic_json(mapping + "/mapping.json", {{"configuration", configuration}, {"outputs", alignments}});
@@ -767,7 +800,7 @@ class Driver {
         core(args, "Build outward contig-end consensus at k = " + number(k), true);
         replace(extended + ".tmp", extended); replace(extended + ".tmp.info", extended + ".info"); replace(stats + ".tmp", stats);
       } catch (...) { remove_file(extended + ".tmp"); remove_file(extended + ".tmp.info"); remove_file(stats + ".tmp"); throw; }
-      Json consensus{{"algorithm", "outward-plurality-extended-only-v2"}, {"reference", signature(ends(k))}};
+      Json consensus{{"algorithm", "outward-plurality-read-support-primary-580-all-flash-v8"}, {"reference", signature(ends(k))}};
       consensus["alignments"] = Json::array();
       for (const auto &alignment : alignments) consensus["alignments"].push_back(signature(alignment));
       atomic_json(mapping + "/consensus.json", consensus);
@@ -853,7 +886,7 @@ class Driver {
     if (opt.continue_mode && exists(opt.out_dir + "/done") && exists(final_path())) {
       log("Assembly already completed: " + final_path()); return 0;
     }
-    library(); merge_reads();
+    merge_reads(); library();
     if (opt.legacy_k_list) log("Shared k list (legacy): " + Json(opt.k_list).dump());
     log("Reduction k list: " + Json(opt.reduction_k_list).dump());
     log("Flanking k list: " + Json(opt.flanking_k_list).dump());

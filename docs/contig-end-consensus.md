@@ -9,17 +9,18 @@ After the reduction/merge pass ends at k59, consensus local contigs from k59
 and the full k59 contigs, bubbles, and additional contigs seed a fresh k21
 SdBG. This seed graph does not reuse first-pass read-count edges. The flanking
 pass then assembles the full configured k-list, by default
-21,29,39,59,79,99,119,141. First-pass files remain unchanged.
+21,31,41,61,81,101,141. First-pass files remain unchanged.
 
 At the handoff and every subsequent flanking transition, the consensus stage runs:
 
 1. Extract contig ends to `OUT_DIR/tmp/k59/k59.contig_ends.fa`.
-2. Map merged gzip FASTA libraries to that file with Minimap2.
+2. Map merged and unmerged FLASH gzip FASTA exports listed in `assembly_inputs.json` to that file with Minimap2.
 3. Build outward consensus extensions in native C++.
 4. Publish extended records as `intermediate_contigs/k59.local.fa` and its info file.
 5. At the handoff, build the k21 seed graph from the k59 sequences. Thereafter,
    extract iterative edges and build the next SdBG with the new local-contig
-   input, repeating from k21 to k29 through k119 to k141.
+   input, following the configured flanking list through k141. With
+   `--flanking-consensus-only`, no read-derived iterative edges are added.
 
 The handoff uses the paths shown above. The second pass uses
 `intermediate_contigs/flanking/kN.*` and `tmp/flanking/kN/` to avoid overwriting
@@ -27,8 +28,11 @@ the first pass. Final contigs are merged from the second pass only. Exported
 contig ends, consensus files, and alignments survive normal scratch cleanup
 in both passes.
 
-Mapping and consensus require `--merge-pairs`; without merged reads, the local
-FASTA is empty and its info file is `0 0`. There is no automatic fallback to
+FLASH preprocessing is enabled by default and runs before binary-library
+construction. Merged sequences and both unmerged mates are used as single-end
+assembly inputs, and the same exports supply consensus. `--no-merge-pairs`
+disables this preprocessing and FLASH-based consensus; without these inputs the
+local FASTA is empty and its info file is `0 0`. There is no automatic fallback to
 IDBA. `--no-local` disables local-contig publication and graph input entirely.
 The old core `local` subcommand remains available for standalone use but is
 not called by the launcher. Custom k-lists restart at their configured minimum
@@ -59,10 +63,11 @@ temporary-file cleanup.
 
 The extended FASTA contains only records with at least one added base. Original
 flank sequence is retained inside each emitted record; records with no extension
-are omitted. Headers begin with `flag=0 multi=1` for graph-reader compatibility
-and also report `reference_length`, `left_extension`, `right_extension`, and
-the new `len`. Multiplicity 1 follows the previous local-contig convention;
-it is not a measured pileup depth. The TSV still covers all reference fragments
+are omitted. Headers begin with `flag=0 multi=N` for graph-reader compatibility,
+where N is the number of reads contributing outward votes, capped at 65,535.
+They also report uncapped `support_reads`, `reference_length`, `left_extension`,
+`right_extension`, and the new `len`. This is one multiplicity per record, not
+per-base pileup depth. The TSV still covers all reference fragments
 for diagnostics, including those omitted from the FASTA.
 
 `k59.local.fa` and its `.info` file are copies of the extended FASTA and its
