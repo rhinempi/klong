@@ -794,7 +794,7 @@ class Driver {
       }
       std::string extended = parent(ends(k)) + "/k" + number(k) + ".contig_ends.extended.fa";
       std::string stats = mapping + "/consensus.tsv";
-      Args args{"endconsensus", ends(k), extended + ".tmp", stats + ".tmp"};
+      Args args{"endconsensus", "-t", number(opt.num_cpu_threads), ends(k), extended + ".tmp", stats + ".tmp"};
       args.insert(args.end(), alignments.begin(), alignments.end());
       try {
         core(args, "Build outward contig-end consensus at k = " + number(k), true);

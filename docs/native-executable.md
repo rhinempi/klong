@@ -132,6 +132,13 @@ for the whole extended record, not per-base extension coverage. It is capped at
 `secondary_reads` is now always zero. `primary_reads` counts alignment records;
 `overhang_reads` is the per-query-group deduplicated support count used for multiplicity.
 
+The consensus engine uses the workflow CPU count for query-boundary SAM ranges
+and bounded parallel consensus calling; ordered output is byte-identical across
+thread counts. Standalone syntax is `megahit endconsensus -t N ends.fa extended.fa
+stats.tsv input.sam ...` (omit `-t` for one worker). Cached consensus remains valid
+because threading does not change the algorithm or output format. See
+[consensus details](contig-end-consensus.md) for memory behavior and measurements.
+
 Alignments must be grouped by query name, as in the workflow's unsorted Minimap2
 SAM output. A query contributes at most once per reference end within its group,
 using the first primary placement with an eligible outward vote. Normal mapping

@@ -1,12 +1,16 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <mutex>
+#include <omp.h>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "sequence/io/fastx_reader.h"
@@ -15,6 +19,12 @@
 
 namespace {
 using Counts = std::array<uint64_t, 4>;
+using VoteLocks = std::array<std::mutex, 4096>;
+
+struct SamRange {
+  std::string path;
+  std::streamoff begin, end;
+};
 
 struct Reference {
   std::string name;
@@ -98,16 +108,67 @@ std::string Consensus(const std::vector<Counts> &votes) {
   return result;
 }
 
-void ProcessSam(const std::string &path, std::vector<Reference> *references,
-                const std::unordered_map<std::string, size_t> &index) {
-  std::ifstream source(path);
+// Move each cut past its current query group, preserving per-read deduplication.
+std::streamoff QueryBoundary(const std::string &path, std::streamoff offset,
+                             std::streamoff length) {
+  if (offset == 0 || offset == length) return offset;
+  std::ifstream source(path, std::ios::binary);
   if (!source) throw std::runtime_error("Cannot open SAM: " + path);
+  source.seekg(offset - 1);
+  char previous;
+  if (!source.get(previous)) throw std::runtime_error("Cannot seek SAM: " + path);
+  std::string line, query;
+  if (previous != '\n') std::getline(source, line);
+  bool first = true;
+  while (source) {
+    auto position = source.tellg();
+    if (!std::getline(source, line)) break;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) continue;
+    if (line[0] == '@') return position;
+    auto name = line.substr(0, line.find('\t'));
+    if (!first && name != query) return position;
+    query = std::move(name);
+    first = false;
+  }
+  if (source.bad()) throw std::runtime_error("Error reading SAM: " + path);
+  return length;
+}
+
+std::vector<SamRange> SplitSam(const std::vector<std::string> &paths, int threads) {
+  std::vector<SamRange> ranges;
+  for (const auto &path : paths) {
+    std::ifstream source(path, std::ios::binary | std::ios::ate);
+    if (!source) throw std::runtime_error("Cannot open SAM: " + path);
+    std::streamoff length = source.tellg();
+    if (length < 0) throw std::runtime_error("Cannot determine SAM size: " + path);
+    std::streamoff begin = 0;
+    for (int i = 1; i <= threads; ++i) {
+      auto target = (length / threads) * i + (length % threads) * i / threads;
+      auto end = QueryBoundary(path, target, length);
+      if (end > begin) ranges.push_back({path, begin, end});
+      begin = end;
+    }
+  }
+  return ranges;
+}
+
+void ProcessSam(const SamRange &range, std::vector<Reference> *references,
+                const std::unordered_map<std::string, size_t> &index, VoteLocks &locks) {
+  const auto &path = range.path;
+  std::ifstream source(path, std::ios::binary);
+  if (!source) throw std::runtime_error("Cannot open SAM: " + path);
+  source.seekg(range.begin);
+  if (!source) throw std::runtime_error("Cannot seek SAM: " + path);
   SeqPackage packed_read;
   std::string current_read;
   std::vector<size_t> voted_references;
   std::string line;
   uint64_t line_number = 0;
-  while (std::getline(source, line)) {
+  std::streamoff position_in_file = range.begin;
+  while (position_in_file < range.end && std::getline(source, line)) {
+    auto line_offset = position_in_file;
+    position_in_file += static_cast<std::streamoff>(line.size()) + (source.eof() ? 0 : 1);
     ++line_number;
     if (!line.empty() && line.back() == '\r') line.pop_back();
     if (line.empty()) continue;
@@ -138,7 +199,11 @@ void ProcessSam(const std::string &path, std::vector<Reference> *references,
       auto entry = index.find(fields[2]);
       if (entry == index.end()) throw std::runtime_error("Unknown SAM reference: " + fields[2]);
       auto &ref = (*references)[entry->second];
-      ++ref.primary_reads;
+      auto &mutex = locks[entry->second % locks.size()];
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++ref.primary_reads;
+      }
       if (std::find(voted_references.begin(), voted_references.end(), entry->second) != voted_references.end()) continue;
       if (fields[9] == "*") continue;
       uint64_t position = Number(fields[3]);
@@ -176,6 +241,7 @@ void ProcessSam(const std::string &path, std::vector<Reference> *references,
       size_t qpos = 0;
       int64_t rpos = static_cast<int64_t>(position - 1);
       bool voted = false;
+      std::lock_guard<std::mutex> vote_lock(mutex);
       for (size_t i = 0; i < cigar.size(); ++i) {
         const auto &op = cigar[i];
         if (op.code == 'S') {
@@ -207,22 +273,34 @@ void ProcessSam(const std::string &path, std::vector<Reference> *references,
         voted_references.push_back(entry->second);
       }
     } catch (const std::exception &error) {
-      throw std::runtime_error(path + ":" + std::to_string(line_number) + ": " + error.what());
+      auto location = range.begin == 0 ? std::to_string(line_number) : "byte " + std::to_string(line_offset);
+      throw std::runtime_error(path + ":" + location + ": " + error.what());
     }
   }
-  if (!source.eof()) throw std::runtime_error("Error reading SAM: " + path);
+  if (source.bad() || (!source.eof() && position_in_file < range.end))
+    throw std::runtime_error("Error reading SAM: " + path);
 }
 }  // namespace
 
 int main_contig_end_consensus(int argc, char **argv) {
-  if (argc < 5) {
-    std::cerr << "Usage: endconsensus <ends.fa> <extended.fa> <stats.tsv> <alignments.sam>...\n";
-    return 1;
-  }
   try {
+    int first = 1, threads = 1;
+    while (first < argc) {
+      std::string option(argv[first]);
+      if (option == "--") { ++first; break; }
+      if (option != "-t" && option != "--threads" && option != "--num-cpu-threads") break;
+      if (++first >= argc) throw std::runtime_error("Missing consensus thread count");
+      auto value = Number(argv[first++]);
+      if (value == 0 || value > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+        throw std::runtime_error("Consensus thread count must be positive and fit an integer");
+      threads = static_cast<int>(value);
+    }
+    if (argc - first < 4) throw std::runtime_error(
+        "Usage: endconsensus [-t threads] <ends.fa> <extended.fa> <stats.tsv> <alignments.sam>...");
+    threads = std::min(threads, std::max(1, omp_get_num_procs()));
     std::vector<Reference> references;
     std::unordered_map<std::string, size_t> index;
-    FastxReader reader(argv[1]);
+    FastxReader reader(argv[first]);
     while (auto record = reader.ReadNext()) {
       Reference ref;
       ref.name.assign(record->name.s, record->name.l);
@@ -232,27 +310,56 @@ int main_contig_end_consensus(int argc, char **argv) {
       ref.extend_right = !EndsWith(ref.name, "|start");
       references.emplace_back(std::move(ref));
     }
-    for (int i = 4; i < argc; ++i) ProcessSam(argv[i], &references, index);
-    std::ofstream output(argv[2]), stats(argv[3]), info(std::string(argv[2]) + ".info");
+    std::vector<std::string> paths;
+    for (int i = first + 3; i < argc; ++i) paths.emplace_back(argv[i]);
+    auto ranges = SplitSam(paths, threads);
+    int workers = std::min(threads, std::max(1, static_cast<int>(ranges.size())));
+    std::cerr << "Consensus workers: " << workers << ", SAM ranges: " << ranges.size() << '\n';
+    VoteLocks locks;
+    std::vector<std::exception_ptr> errors(ranges.size());
+#pragma omp parallel for num_threads(workers) schedule(dynamic, 1) if(workers > 1)
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      try { ProcessSam(ranges[i], &references, index, locks); }
+      catch (...) { errors[i] = std::current_exception(); }
+    }
+    for (const auto &error : errors) if (error) std::rethrow_exception(error);
+    std::ofstream output(argv[first + 1]), stats(argv[first + 2]), info(std::string(argv[first + 1]) + ".info");
     if (!output || !stats || !info) throw std::runtime_error("Cannot open consensus output files");
     stats << "reference\treference_length\tleft_added\tright_added\tprimary_reads\toverhang_reads\tsecondary_reads\n";
     uint64_t extended = 0, added = 0, output_bases = 0;
-    for (const auto &ref : references) {
-      auto left = Consensus(ref.left), right = Consensus(ref.right);
-      std::reverse(left.begin(), left.end());
-      stats << ref.name << '\t' << ref.sequence.size() << '\t' << left.size() << '\t'
-            << right.size() << '\t' << ref.primary_reads << '\t' << ref.overhang_reads
-            << '\t' << ref.secondary_reads << '\n';
-      if (left.empty() && right.empty()) continue;
-      auto length = left.size() + ref.sequence.size() + right.size();
-      auto multiplicity = std::min(ref.overhang_reads, static_cast<uint64_t>(kMaxMul));
-      output << '>' << ref.name << " flag=0 multi=" << multiplicity
-             << " support_reads=" << ref.overhang_reads << " reference_length=" << ref.sequence.size()
-             << " left_extension=" << left.size() << " right_extension=" << right.size()
-             << " len=" << length << '\n' << left << ref.sequence << right << '\n';
-      ++extended;
-      added += left.size() + right.size();
-      output_bases += length;
+    struct Extension { std::string left, right; };
+    const size_t block_size = 1024;
+    for (size_t begin = 0; begin < references.size(); begin += block_size) {
+      size_t count = std::min(block_size, references.size() - begin);
+      std::vector<Extension> extensions(count);
+      std::vector<std::exception_ptr> failures(count);
+#pragma omp parallel for num_threads(threads) schedule(static) if(threads > 1)
+      for (size_t i = 0; i < count; ++i) {
+        try {
+          extensions[i].left = Consensus(references[begin + i].left);
+          extensions[i].right = Consensus(references[begin + i].right);
+          std::reverse(extensions[i].left.begin(), extensions[i].left.end());
+        } catch (...) { failures[i] = std::current_exception(); }
+      }
+      for (const auto &error : failures) if (error) std::rethrow_exception(error);
+      for (size_t i = 0; i < count; ++i) {
+        const auto &ref = references[begin + i];
+        const auto &left = extensions[i].left;
+        const auto &right = extensions[i].right;
+        stats << ref.name << '\t' << ref.sequence.size() << '\t' << left.size() << '\t'
+              << right.size() << '\t' << ref.primary_reads << '\t' << ref.overhang_reads
+              << '\t' << ref.secondary_reads << '\n';
+        if (left.empty() && right.empty()) continue;
+        auto length = left.size() + ref.sequence.size() + right.size();
+        auto multiplicity = std::min(ref.overhang_reads, static_cast<uint64_t>(kMaxMul));
+        output << '>' << ref.name << " flag=0 multi=" << multiplicity
+               << " support_reads=" << ref.overhang_reads << " reference_length=" << ref.sequence.size()
+               << " left_extension=" << left.size() << " right_extension=" << right.size()
+               << " len=" << length << '\n' << left << ref.sequence << right << '\n';
+        ++extended;
+        added += left.size() + right.size();
+        output_bases += length;
+      }
     }
     info << extended << ' ' << output_bases << '\n';
     output.close();

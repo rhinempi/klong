@@ -83,6 +83,28 @@ counters for each overhang position. SAM text is parsed once; no Python
 per-base pileup or external consensus package is used. References and FASTA
 output remain strings to preserve their original sequence, including any Ns.
 
+The native workflow forwards its CPU count to `endconsensus -t N`. Standalone
+calls retain a one-worker default when `-t` is omitted. `--threads N` and
+`--num-cpu-threads N` are also accepted before the positional arguments.
+
+SAM files are split into byte ranges at query-group boundaries, so one large
+SAM can use multiple workers without splitting a read's deduplication state.
+Each worker uses its own input stream and packed-read scratch space. Shared
+vote arrays/counters use 4,096 sharded locks rather than one complete pileup
+per worker. Final consensus strings are computed in bounded blocks of 1,024
+references, then FASTA, TSV, and info records are written in reference order.
+Thread count does not change the consensus rules or output bytes. Worker parse
+errors are collected before output files are opened; error locations in later
+ranges use byte offsets. Parallel input files must support seeking.
+
+On the saved E. coli k21 mappings, median consensus time over three repeats was
+0.391 s before and 0.103 s with eight workers (3.78x). A single-SAM synthetic
+workload with one million query groups took 2.169 s before and 0.375 s with
+eight workers (5.79x). These are consensus-only, cached-file measurements, not
+whole-assembly speedups. All FASTA, TSV, and `.info` hashes matched exactly.
+Reproduce with `tests/benchmark_consensus.py`; performance depends on I/O,
+reference distribution, and contention at highly covered ends.
+
 Only mapped primary records vote. Secondary and supplementary alignments are
 excluded to avoid repeatedly voting from alternative alignments of a read.
 Reverse-strand SAM SEQ is already reverse-complemented by the aligner; it must

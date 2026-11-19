@@ -33,7 +33,7 @@ class NativeConsensusTest(unittest.TestCase):
         self.output = self.root / 'extended.fa'
         self.stats = self.root / 'stats.tsv'
 
-    def run_engine(self, records, references=None, extra_sams=None, check=True):
+    def run_engine(self, records, references=None, extra_sams=None, check=True, threads=None):
         references = references or {'ref': 'ACGT'}
         self.reference.write_text(''.join('>{}\n{}\n'.format(name, seq) for name, seq in references.items()))
         header = ''.join('@SQ\tSN:{}\tLN:{}\n'.format(name, len(seq)) for name, seq in references.items())
@@ -44,8 +44,66 @@ class NativeConsensusTest(unittest.TestCase):
             path = self.root / 'extra.{}.sam'.format(i)
             path.write_text(header + ''.join(rows))
             sams.append(str(path))
-        return subprocess.run([CORE, 'endconsensus', str(self.reference), str(self.output),
+        options = [] if threads is None else ['-t', str(threads)]
+        return subprocess.run([CORE, 'endconsensus'] + options + [str(self.reference), str(self.output),
                                str(self.stats)] + sams, capture_output=True, text=True, check=check)
+
+    def snapshot(self):
+        return (self.output.read_bytes(), Path(str(self.output) + '.info').read_bytes(), self.stats.read_bytes())
+
+    def test_parallel_matches_serial_across_query_boundaries_and_libraries(self):
+        sequence = 'ACGT' * 24
+        references = {'ref{}'.format(i) + ('|start' if i % 3 == 0 else '|end' if i % 3 == 1 else ''):
+                      sequence for i in range(31)}
+        names = list(references)
+        rows = []
+        for i in range(12000):
+            name, ref = 'query' + str(i), names[i % len(names)]
+            rows.append(sam_record(name, 'GA' + sequence + 'TGC', '2S96M3S', reference=ref,
+                                   flag=16 if i % 2 else 0))
+            rows.append(sam_record(name, 'TT' + sequence + 'AAA', '2S96M3S', reference=ref))
+            if i % 7 == 0:
+                rows.append(sam_record(name, 'TT' + sequence + 'AAA', '2S96M3S', reference=ref, flag=256))
+        extra = [[sam_record('query' + str(i), 'CA' + sequence + 'TGC', '2S96M3S',
+                             reference=names[i % len(names)]) for i in range(1000)], []]
+        self.run_engine(rows, references, extra_sams=extra, threads=1)
+        expected = self.snapshot()
+        for threads in (2, 4, 8):
+            with self.subTest(threads=threads):
+                self.run_engine(rows, references, extra_sams=extra, threads=threads)
+                self.assertEqual(self.snapshot(), expected)
+
+    def test_parallel_does_not_split_a_large_query_group(self):
+        rows = [sam_record('same', 'ACGTA', '4M1S')] * 12000
+        rows += [sam_record('different', 'ACGTA', '4M1S')]
+        self.run_engine(rows, threads=1)
+        expected = self.snapshot()
+        self.run_engine(rows, threads=8)
+        self.assertEqual(self.snapshot(), expected)
+        self.assertIn(' multi=2 support_reads=2 ', self.output.read_text())
+
+    def test_parallel_handles_crlf_and_unterminated_last_line(self):
+        rows = [sam_record(str(i), 'ACGTA', '4M1S').replace('\n', '\r\n') for i in range(50)]
+        rows[-1] = rows[-1].rstrip('\r\n')
+        self.run_engine(rows, threads=1)
+        expected = self.snapshot()
+        self.run_engine(rows, threads=8)
+        self.assertEqual(self.snapshot(), expected)
+
+    def test_parallel_worker_failure_does_not_publish_output(self):
+        rows = [sam_record(str(i), 'ACGTA', '4M1S') for i in range(400)]
+        rows.insert(250, sam_record('bad', 'ACGTA', '2M1S2M'))
+        result = self.run_engine(rows, threads=4, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Internal soft clip', result.stderr)
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.stats.exists())
+
+    def test_invalid_thread_counts_are_rejected(self):
+        for value in (0, -1, 'abc', 2 ** 32):
+            with self.subTest(value=value):
+                result = self.run_engine([], threads=value, check=False)
+                self.assertNotEqual(result.returncode, 0)
 
     def test_five_A_beats_four_G(self):
         rows = [sam_record(str(i), 'ACGTA', '4M1S') for i in range(5)]

@@ -111,6 +111,9 @@ class NativeWorkflowTest(unittest.TestCase):
         stages = [args[1] for args in commands]
         self.assertLess(stages.index('flash'), stages.index('buildlib'))
         self.assertLess(stages.index('buildlib'), stages.index('count'))
+        consensus = [args for args in commands if args[1] == 'endconsensus']
+        self.assertTrue(consensus)
+        self.assertTrue(all(args[args.index('-t') + 1] == str(options['num_cpu_threads']) for args in consensus))
         self.assertIn('no merge Bloom filters', log)
         assembled = re.findall(r'Assemble contigs from SdBG for k = (\d+)', log)
         order = list(map(int, assembled))

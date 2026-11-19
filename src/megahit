@@ -1093,7 +1093,8 @@ def extend_contig_ends(cur_k):
             logger.info('Reuse contig-end consensus at k = %d', cur_k)
             return output
     remove_if_exists(manifest)
-    cmd = [opt.megahit_core, 'endconsensus', reference, output + '.tmp', stats + '.tmp'] + alignments
+    cmd = [opt.megahit_core, 'endconsensus', '-t', str(max(1, opt.num_cpu_threads)),
+           reference, output + '.tmp', stats + '.tmp'] + alignments
     try:
         run_sub_command(cmd, 'Build outward contig-end consensus at k = %d' % cur_k, verbose=True)
         os.replace(output + '.tmp', output)
