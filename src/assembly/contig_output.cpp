@@ -62,7 +62,7 @@ void FoldPalindrome(std::string &s, unsigned kmer_k, bool is_loop) {
 
 void OutputContigs(UnitigGraph &graph, ContigWriter *contig_writer,
                    ContigWriter *final_contig_writer, bool change_only,
-                   uint32_t min_standalone) {
+                   uint32_t min_standalone, uint32_t min_contig_len) {
   assert(!(change_only && final_contig_writer != nullptr));  // if output
                                                              // changed contigs,
                                                              // must not output
@@ -74,6 +74,7 @@ void OutputContigs(UnitigGraph &graph, ContigWriter *contig_writer,
     if (change_only && !adapter.IsChanged()) {
       continue;
     }
+    if (static_cast<uint64_t>(adapter.GetLength()) + graph.k() < min_contig_len) continue;
     double multi = change_only ? 1
                                : std::min(static_cast<double>(kMaxMul),
                                           adapter.GetAvgDepth());
@@ -95,7 +96,8 @@ void OutputContigs(UnitigGraph &graph, ContigWriter *contig_writer,
           writer = final_contig_writer;
         }
       }
-      writer->WriteContig(ascii_contig, graph.k(), i, flag, multi);
+      if (ascii_contig.size() >= min_contig_len)
+        writer->WriteContig(ascii_contig, graph.k(), i, flag, multi);
     } else {
       auto out_file = contig_writer;
       int flag = 0;
@@ -114,7 +116,8 @@ void OutputContigs(UnitigGraph &graph, ContigWriter *contig_writer,
           }
         }
       }
-      out_file->WriteContig(ascii_contig, graph.k(), i, flag, multi);
+      if (ascii_contig.size() >= min_contig_len)
+        out_file->WriteContig(ascii_contig, graph.k(), i, flag, multi);
     }
   }
 }

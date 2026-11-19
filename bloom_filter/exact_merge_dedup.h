@@ -15,6 +15,8 @@ class ExactMergeDedup {
   virtual ~ExactMergeDedup() = default;
   virtual void AddBase(const uint64_t *key, int worker) = 0;
   virtual void AddCandidate(const uint64_t *key, uint64_t ordinal) = 0;
+  virtual void AddRecord(const uint64_t *key, uint64_t priority, int worker) = 0;
+  virtual void FinishUnordered(const std::function<void(const uint64_t *, uint64_t, int)> &emit) = 0;
   virtual void Check() const = 0;
   virtual void Finish(const std::function<void(const uint64_t *, uint64_t)> &emit) = 0;
   virtual ExactDedupStats Stats() const = 0;

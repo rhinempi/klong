@@ -163,12 +163,31 @@ its Bloom allocation now receives the workflow memory budget. See
 Assembly skips unused depth inference, uses thread-private histograms, avoids
 no-change refreshes, and checks changed-only output before sequence reconstruction.
 See [Assembly Performance](assembly-performance.md) for details and comparison commands.
-Contig-end matching also supports `--merge-index fm` for an exact BWT/FM-index
-backend. Hash remains the measured default; see
-[Contig-End FM Index](merge-fm-index.md) for parallelism and comparison results.
+Intermediate reduction assemblies output only contigs longer than the next k
+(for example, at least 30 bp for k21 -> k29). The merge extracts packed
+(next-k+1)-mer windows directly from those contigs and combines them with the
+read-counted next-k edges. It no longer writes short/long split FASTA files or
+searches short-contig ends against the next-k edges; no overlap index is built.
+The final reduction assembly retains its usual output lengths. Its input is the
+last `merged_edges` set, which includes the preceding assembly's novel edges;
+this set is not generally redundant with `read_count`.
+
+`--merge-index hash|fm` remains accepted for compatibility, but has no effect on
+these long-only merges. The standalone core merge still supports short-contig
+matching; see [Contig-End FM Index](merge-fm-index.md) for that mode's benchmarks.
 The default `--merge-dedup sort` replaces merge Bloom filtering with exact external sorting;
 see [Exact Sort-Based Merge Deduplication](merge-sort-dedup.md) for memory/disk
 tradeoffs, measurements, and reproduction commands.
+Intermediate merges now retain duplicate additions without filtering or sorting.
+After reduction, only surviving records are exactly deduplicated into
+`reduced_edges`, retaining the maximum multiplicity for each canonical key.
+This is not a sum of counts. The terminal reduction k has no later reduction,
+so its merge still uses `--merge-dedup`: exact sorting by default suppresses
+duplicate additions and preserves original base records and counts. Parallel
+extraction, worker-local sorting and key-range merging are described in the
+deduplication document above. Versioned reduction and merge checkpoints rebuild the
+affected stages of incomplete older runs. Completed runs remain completed on
+`--continue`; use a fresh output directory to rebuild them with this behavior.
 
 Native runs write `options.json` with `workflow_driver: native-cpp-v1` and
 `checkpoints.native.json`. Resume validates input paths, sizes, and modification

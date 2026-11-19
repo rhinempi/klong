@@ -45,6 +45,7 @@ struct LocalAsmOption {
   int local_width{1000};
   int max_tip_len{-1};
   int min_standalone{200};
+  int min_contig_len{0};
   double min_depth{-1};
   bool is_final_round{false};
   int bubble_level{2};
@@ -77,6 +78,8 @@ void ParseAsmOption(int argc, char *argv[]) {
       "min_standalone", "", opt.min_standalone,
       "min length of a standalone contig to output to final.contigs.fa");
   desc.AddOption("bubble_level", "", opt.bubble_level, "bubbles level 0-3");
+  desc.AddOption("min_contig_len", "", opt.min_contig_len,
+                 "minimum output contig length; 0 keeps all lengths");
   desc.AddOption("merge_len", "", opt.merge_len,
                  "merge complex bubbles of length <= merge_len * k");
   desc.AddOption("merge_similar", "", opt.merge_similar,
@@ -101,6 +104,7 @@ void ParseAsmOption(int argc, char *argv[]) {
 
   try {
     desc.Parse(argc, argv);
+    if (opt.min_contig_len < 0) throw std::logic_error("Minimum output contig length cannot be negative");
     if (opt.sdbg_name.empty()) {
       throw std::logic_error("no succinct de Bruijn graph name!");
     }
@@ -262,7 +266,7 @@ int main_assemble(int argc, char **argv) {
 
     OutputContigs(graph, &contig_writer,
                   opt.output_standalone ? &standalone_writer : nullptr, false,
-                  opt.min_standalone);
+                  opt.min_standalone, opt.min_contig_len);
     timer.stop();
     xinfo("Time to output: {}\n", timer.elapsed());
   }
@@ -290,11 +294,11 @@ int main_assemble(int argc, char **argv) {
     CalcAndPrintStat(graph);
 
     if (!opt.is_final_round) {
-      OutputContigs(graph, &addi_contig_writer, nullptr, true, 0);
+      OutputContigs(graph, &addi_contig_writer, nullptr, true, 0, opt.min_contig_len);
     } else {
       OutputContigs(graph, &contig_writer,
                     opt.output_standalone ? &standalone_writer : nullptr, false,
-                    opt.min_standalone);
+                    opt.min_standalone, opt.min_contig_len);
     }
 
     auto stat_changed = CalcAndPrintStat(graph, false, true);

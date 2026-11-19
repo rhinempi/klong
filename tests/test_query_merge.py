@@ -113,7 +113,10 @@ class QueryMergeTest(unittest.TestCase):
                                          '--merge_index', backend, '--merge_dedup',
                                          'bloom' if reports else 'sort'], stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, check=True, text=True)
-                self.assertIn('Merge index: ' + backend, result.stderr)
+                has_queries = any(len(seq) >= overlap and
+                                  all(base in 'ACGT' for base in (seq[:overlap] + seq[-overlap:]).upper())
+                                  for seq in contigs)
+                self.assertIn('Merge index: ' + (backend if has_queries else 'disabled'), result.stderr)
                 if benchmark:
                     bench = list(command)
                     bench[bench.index('merge')] = 'index-bench'

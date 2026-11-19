@@ -15,6 +15,6 @@ class UnitigGraph;
 
 void OutputContigs(UnitigGraph &graph, ContigWriter *contig_writer,
                    ContigWriter *final_contig_writer, bool change_only,
-                   uint32_t min_standalone);
+                   uint32_t min_standalone, uint32_t min_contig_len = 0);
 
 #endif  // MEGAHIT_CONTIG_OUTPUT_H

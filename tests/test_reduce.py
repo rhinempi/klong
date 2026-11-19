@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 
-from test_query_merge import pack, reverse_complement
+from test_query_merge import canonical, pack, reverse_complement
 
 CORE = os.environ.get('MEGAHIT_TEST_CORE')
 BASELINE = os.environ.get('MEGAHIT_TEST_BASELINE_CORE')
@@ -101,6 +101,40 @@ class ReductionTest(unittest.TestCase):
         output, result = self.reduce('large', 21, 29, short, longer, threads=4)
         self.assertEqual(self.records(output, words), collections.Counter({pack(sequence, 17): len(queries)}))
         self.assertIn('2 filtering chunks, 4 workers', result.stderr)
+        output, _ = self.reduce('large-unique', 21, 29, short, longer, threads=12,
+                                extra=['--reduce_dedup', '--sort_memory_mb', '0.0625'])
+        self.assertEqual(self.records(output, words), collections.Counter({pack(canonical(sequence), 17): 1}))
+
+    def test_post_reduction_dedup_orientations_counts_and_multipass(self):
+        for k, long_k in ((21, 29), (39, 59), (127, 141), (254, 255)):
+            rng = random.Random(k)
+            dna = lambda n: ''.join(rng.choice('ACGT') for _ in range(n))
+            sequences = [canonical(dna(k + 1)) for _ in range(4500)]
+            rows = [(seq, 3) for seq in sequences]
+            rows += [(reverse_complement(seq), 50) for seq in sequences]
+            rows += [(seq, 65535) for seq in sequences[:10]]
+            short, words = self.write_edges('duplicates', k, [rows])
+            # Remove every orientation of the first sequence, not just its duplicates.
+            seq = sequences[0]
+            longer, _ = self.write_edges('representatives', long_k,
+                                        [[(seq + dna(long_k - k), 7),
+                                          (reverse_complement(seq) + dna(long_k - k), 7)]])
+            expected = collections.Counter(pack(seq, 65535 if i < 10 else 50)
+                                           for i, seq in enumerate(sequences) if i)
+            for threads in (1, 4, 12):
+                with self.subTest(k=k, threads=threads):
+                    output, result = self.reduce('unique-{}-{}'.format(k, threads), k, long_k,
+                                                short, longer, threads,
+                                                ['--reduce_dedup', '--sort_memory_mb', '0.0625'])
+                    self.assertEqual(self.records(output, words), expected)
+                    self.assertIn('unique surviving edges', result.stderr)
+                    self.assertFalse(list(self.root.glob(output.name + '.sort-*')))
+
+    def test_post_reduction_dedup_empty_survivors(self):
+        short, words = self.write_edges('all-short', 21, [[('A' * 22, 3), ('T' * 22, 50)]])
+        longer, _ = self.write_edges('all-long', 29, [[('A' * 30, 2)]])
+        output, _ = self.reduce('empty-unique', 21, 29, short, longer, 4, ['--reduce_dedup'])
+        self.assertFalse(self.records(output, words))
 
     def test_large_long_shard_uses_multiple_insertion_chunks(self):
         short, words = self.write_edges('short', 21, [[('A' * 22, 17), ('T' * 22, 9)]])

@@ -62,6 +62,19 @@ class ExactMergeDedupTest(unittest.TestCase):
         self.assertIn('no merge Bloom filters', result.stderr)
         self.check_output(output, 2)
 
+    def test_long_only_merge_without_short_contig_input(self):
+        self.fixture(3, 5, [[('AACCGG', 7), ('AACCGG', 19)], []], [],
+                     ['AACCGGTTAACC', 'AACCGGTTAACC', 'GGTTAACCGGTT'])
+        position = self.command.index('--contig')
+        del self.command[position:position + 2]
+        output, result = self.run_merge('long-only', threads=4)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Merge index: disabled', result.stderr)
+        self.check_output(output, 4)
+        # Both original base records survive unchanged; generated copies do not.
+        data = Path(str(output) + '.edges.0').read_bytes()
+        self.assertTrue(data.startswith(pack('AACCGG', 7) + pack('AACCGG', 19)))
+
     def test_word_widths_orientations_multiplicity_and_order(self):
         for overlap, k in [(3, 5), (21, 29), (31, 32), (39, 59), (63, 79), (95, 99),
                             (127, 141), (159, 179), (191, 199), (223, 239), (254, 255)]:
@@ -81,6 +94,24 @@ class ExactMergeDedupTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn('no merge Bloom filters', result.stderr)
                     self.check_output(output, threads)
+
+    def test_deferred_merge_preserves_duplicate_candidates(self):
+        self.fixture(3, 5, [[('AACCGG', 7)]], [], ['AACCGGTTAACC'] * 50)
+        for threads in (1, 4, 12):
+            output, result = self.run_merge('deferred-' + str(threads), dedup='none', threads=threads)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('deferred until reduction', result.stderr)
+            self.assertIn('Long-contig extraction:', result.stderr)
+            rows = []
+            for path in self.root.glob(output.name + '.edges.[0-9]*'):
+                data = path.read_bytes()
+                rows.extend(data[i:i + 4] for i in range(0, len(data), 4))
+            expected = [pack('AACCGG', 7)]
+            for seq in self.long_contigs:
+                seq = seq[::-1]
+                expected += [pack(canonical(seq[i:i + 6]), 50) for i in range(len(seq) - 5)]
+            self.assertCountEqual(rows, expected)
+            self.assertFalse(list(self.root.glob(output.name + '.sort-*')))
 
     def test_duplicate_base_edges_palindromes_and_empty_inputs(self):
         for shards, short, long in [([[('AACGTT', 7), ('AACCGG', 2)], [('AACCGG', 19)]],

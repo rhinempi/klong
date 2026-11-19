@@ -317,7 +317,9 @@ class Driver {
       if (pid <= 0) continue;
       int status;
       if (waitpid(pid, &status, WNOHANG) == 0) {
-        kill(pid, SIGTERM);
+        // A just-forked producer can still inherit the driver's SIGTERM handler.
+        // Abort disposable FIFO writers even in that pre-exec window.
+        kill(pid, SIGKILL);
         while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
       }
     }
@@ -630,46 +632,28 @@ class Driver {
     std::string input = from == initial_k() ? graph(from) : reduction_path(from, "merged_edges");
     if (!exists(input + ".edges.info") && from != initial_k()) input = read_count(from);
     std::string longer = read_count(to), output = reduction_path(from, "reduced_edges");
-    checkpoint("reduce-k" + number(from) + "-k" + number(to), {output + ".edges.info"}, [&]() {
+    checkpoint("reduce-dedup-v3-k" + number(from) + "-k" + number(to), {output + ".edges.info"}, [&]() {
       if (!exists(input + ".edges.info") || !exists(longer + ".edges.info")) throw Error("Missing reduction input edges");
       clear_edges(output);
       core({"prefixbf", "--mode", "reduce", "--short_prefix", input, "--long_prefix", longer,
             "--output_prefix", output, "--short_k", number(from), "--long_k", number(to),
             "--num_cpu_threads", number(opt.num_cpu_threads), "--human_readable", "0",
+            "--reduce_dedup", "--sort_memory_mb", number(opt.merge_sort_memory),
             "--max_bloom_gb", "60", "--reserve_gb", "1", "--host_mem", number(host_mem)},
            "Reduce edges for k = " + number(from) + " using k = " + number(to), true);
     });
     return output;
   }
-  void split_contigs(int from, int to) {
-    std::string prefix = contig(from);
-    std::string shorter = prefix + ".lt_k" + number(to) + "_plus1.contigs.fa";
-    std::string longer = prefix + ".ge_k" + number(to) + "_plus1.contigs.fa";
-    std::ofstream short_out(shorter), long_out(longer);
-    uint64_t short_count = 0, short_bases = 0, long_count = 0, long_bases = 0;
-    read_fasta(prefix + ".contigs.fa", [&](const std::string &header, const std::string &sequence) {
-      bool small = sequence.size() < static_cast<size_t>(to + 1);
-      std::ostream &dest = small ? short_out : long_out;
-      dest << header << '\n' << sequence << '\n';
-      if (small) { ++short_count; short_bases += sequence.size(); }
-      else { ++long_count; long_bases += sequence.size(); }
-    });
-    short_out.close(); long_out.close();
-    if (!short_out || !long_out) throw Error("Cannot split intermediate contigs");
-    log("Split k = " + number(from) + " contigs at length " + number(to + 1) + ": short " +
-        number(short_count) + " contigs/" + number(short_bases) + " bp, long " + number(long_count) +
-        " contigs/" + number(long_bases) + " bp");
-  }
   void merge_edges(int from, int to) {
     std::string prefix = contig(from), output = reduction_path(to, "merged_edges");
-    checkpoint("merge-k" + number(from) + "-k" + number(to), {output + ".edges.info"}, [&]() {
+    const bool terminal = to == opt.reduction_k_list.back();
+    checkpoint("merge-deferred-v3-k" + number(from) + "-k" + number(to), {output + ".edges.info"}, [&]() {
       clear_edges(output);
       core({"prefixbf", "--mode", "merge", "--long_prefix", read_count(to), "--output_prefix", output,
-            "--contig", prefix + ".lt_k" + number(to) + "_plus1.contigs.fa",
-            "--long_contig", prefix + ".ge_k" + number(to) + "_plus1.contigs.fa",
+            "--long_contig", prefix + ".contigs.fa",
             "--short_k", number(from), "--long_k", number(to), "--num_cpu_threads",
             number(opt.num_cpu_threads), "--human_readable", "0", "--merge_index", opt.merge_index,
-            "--merge_dedup", opt.merge_dedup, "--sort_memory_mb", number(opt.merge_sort_memory),
+            "--merge_dedup", terminal ? opt.merge_dedup : "none", "--sort_memory_mb", number(opt.merge_sort_memory),
             "--host_mem", number(host_mem)},
            "Merge k = " + number(from) + " assembly edges into k = " + number(to), true);
     });
@@ -679,9 +663,9 @@ class Driver {
     if (!flanking && !opt.reduction_k_list.empty()) final_k = std::max(final_k, opt.reduction_k_list.back());
     Args outputs{contig(k) + ".contigs.fa", contig(k) + ".contigs.fa.info",
                  contig(k) + ".bubble_seq.fa", contig(k) + ".bubble_seq.fa.info"};
-    if (next) { outputs.push_back(contig(k) + ".lt_k" + number(next) + "_plus1.contigs.fa");
-                outputs.push_back(contig(k) + ".ge_k" + number(next) + "_plus1.contigs.fa"); }
-    checkpoint("assemble-k" + number(k), outputs, [&]() {
+    std::string stage = next ? "assemble-long-only-v2-k" + number(k) + "-to-k" + number(next)
+                             : "assemble-k" + number(k);
+    checkpoint(stage, outputs, [&]() {
       mkdirs(contig_dir());
       remove_file(contig(k) + ".addi.fa");
       remove_file(contig(k) + ".addi.fa.info");
@@ -696,11 +680,11 @@ class Driver {
                 "--disconnect_ratio", number(opt.disconnect_ratio), "--low_local_ratio", number(opt.low_local_ratio),
                 "--min_depth", number(next ? 0 : opt.prune_depth), "--bubble_level", number(next ? 0 : opt.bubble_level),
                 "--max_tip_len", number(next ? 0 : tip)};
+      if (next) args.insert(args.end(), {"--min_contig_len", number(next + 1)});
       if (k < final_k && !next) args.push_back("--careful_bubble");
       if (k == final_k) args.push_back("--is_final_round");
       if (opt.no_local && (flanking || opt.reduction_k_list.empty())) args.push_back("--output_standalone");
       core(args, "Assemble contigs from SdBG for k = " + number(k));
-      if (next) split_contigs(k, next);
     });
   }
   void graph_sequences(int k, int from) {
@@ -912,10 +896,10 @@ class Driver {
         // Resolve the input only when this stage runs: on resume a previously
         // generated reduced prefix must not accidentally become its own input.
         std::string reduced;
-        if (opt.continue_mode && completed.value("reduce-k" + number(from) + "-k" + number(to), false)
+        if (opt.continue_mode && completed.value("reduce-dedup-v3-k" + number(from) + "-k" + number(to), false)
             && resume_valid && exists(reduction_path(from, "reduced_edges") + ".edges.info")) {
           reduced = reduction_path(from, "reduced_edges");
-          visited["reduce-k" + number(from) + "-k" + number(to)] = true;
+          visited["reduce-dedup-v3-k" + number(from) + "-k" + number(to)] = true;
           log("Reuse reduction edges for k = " + number(from));
         } else reduced = reduce(from, to);
         std::string assembled = reduction_path(from, "assembly_graph");

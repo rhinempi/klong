@@ -106,9 +106,22 @@ class ExternalSorter {
   };
   class Reader {
    public:
-    Reader(const std::string &path, Counters &counters) : input_(path, std::ios::binary), counters_(counters),
+    Reader(const std::string &path, Counters &counters, const std::array<uint64_t, Words> *lower = nullptr) : input_(path, std::ios::binary), counters_(counters),
         rows_(std::max<size_t>(1, kIoBytes / sizeof(Row))) {
       if (!input_) throw std::runtime_error("Cannot read sorted run: " + path);
+      if (lower) {
+        input_.seekg(0, std::ios::end);
+        uint64_t first = 0, last = static_cast<uint64_t>(input_.tellg()) / sizeof(Row);
+        while (first < last) {
+          uint64_t mid = first + (last - first) / 2;
+          Row row;
+          input_.seekg(mid * sizeof(Row));
+          input_.read(reinterpret_cast<char *>(&row), sizeof(Row));
+          if (!input_) throw std::runtime_error("Cannot seek sorted run");
+          if (row.key < *lower) first = mid + 1; else last = mid;
+        }
+        input_.seekg(first * sizeof(Row));
+      }
     }
     bool Next(Row *row) {
       if (position_ == count_) {
@@ -163,23 +176,32 @@ class ExternalSorter {
       slot.paths.clear();
     }
     while (paths.size() > kFanIn) {
-      std::vector<std::string> next;
-      for (size_t begin = 0; begin < paths.size(); begin += kFanIn) {
-        std::vector<std::string> group(paths.begin() + begin, paths.begin() + std::min(paths.size(), begin + kFanIn));
-        std::string path = directory_ + "/" + name_ + "-merge-" + std::to_string(merge_id_++);
-        Writer writer(path, counters_);
-        Merge(group, [&](const Row &row) { writer.Write(row); });
-        writer.Close();
-        for (const auto &input : group) Remove(input);
-        next.push_back(path);
+      std::vector<std::string> next((paths.size() + kFanIn - 1) / kFanIn);
+      const size_t first_id = merge_id_;
+      merge_id_ += next.size();
+#pragma omp parallel for schedule(dynamic, 1) num_threads(std::min(workers_, 8))
+      for (size_t batch = 0; batch < next.size(); ++batch) {
+        try {
+          size_t begin = batch * kFanIn;
+          std::vector<std::string> group(paths.begin() + begin, paths.begin() + std::min(paths.size(), begin + kFanIn));
+          std::string path = directory_ + "/" + name_ + "-merge-" + std::to_string(first_id + batch);
+          Writer writer(path, counters_);
+          Merge(group, [&](const Row &row) { writer.Write(row); });
+          writer.Close();
+          for (const auto &input : group) Remove(input);
+          next[batch] = path;
+        } catch (const std::exception &error) { failures_.Save(error); }
       }
+      failures_.Check();
       paths.swap(next);
     }
     return paths;
   }
 
   template <typename Emit>
-  void Merge(const std::vector<std::string> &paths, const Emit &emit) {
+  void Merge(const std::vector<std::string> &paths, const Emit &emit,
+             const std::array<uint64_t, Words> *lower = nullptr,
+             const std::array<uint64_t, Words> *upper = nullptr) {
     struct Head { Row row; size_t reader; };
     struct Greater {
       Less less;
@@ -188,7 +210,7 @@ class ExternalSorter {
     std::priority_queue<Head, std::vector<Head>, Greater> queue(Greater{Less{ordinal_}});
     std::vector<std::unique_ptr<Reader>> readers;
     for (size_t i = 0; i < paths.size(); ++i) {
-      readers.emplace_back(new Reader(paths[i], counters_));
+      readers.emplace_back(new Reader(paths[i], counters_, lower));
       Row row;
       if (readers.back()->Next(&row)) queue.push({row, i});
     }
@@ -196,12 +218,48 @@ class ExternalSorter {
     bool have_previous = false;
     while (!queue.empty()) {
       Head head = queue.top(); queue.pop();
+      if (upper && !(head.row.key < *upper)) break;
       if (ordinal_ || !have_previous || head.row.key != previous.key) {
         emit(head.row); previous = head.row; have_previous = true;
       }
       Row row;
       if (readers[head.reader]->Next(&row)) queue.push({row, head.reader});
     }
+  }
+
+  template <typename Emit>
+  void MergeParallel(const std::vector<std::string> &paths, const Emit &emit) {
+    if (paths.empty()) return;
+    // Disjoint key ranges keep equal keys together across all input runs.
+    std::vector<std::array<uint64_t, Words>> bounds;
+    uint64_t largest = 0;
+    std::string sample;
+    for (const auto &path : paths) {
+      std::ifstream input(path, std::ios::binary | std::ios::ate);
+      if (!input) throw std::runtime_error("Cannot sample sorted run");
+      uint64_t size = static_cast<uint64_t>(input.tellg());
+      if (size > largest) { largest = size; sample = path; }
+    }
+    const int parallelism = std::min(workers_, 8);
+    if (!sample.empty()) {
+      std::ifstream input(sample, std::ios::binary);
+      for (int i = 1; i < parallelism; ++i) {
+        Row row;
+        input.seekg((largest / sizeof(Row) * i / parallelism) * sizeof(Row));
+        input.read(reinterpret_cast<char *>(&row), sizeof(Row));
+        if (!input) throw std::runtime_error("Cannot sample sorted key");
+        if (bounds.empty() || bounds.back() != row.key) bounds.push_back(row.key);
+      }
+    }
+#pragma omp parallel for schedule(dynamic, 1) num_threads(parallelism)
+    for (size_t part = 0; part <= bounds.size(); ++part) {
+      try {
+        Merge(paths, [&](const Row &row) { emit(row, static_cast<int>(part)); },
+              part ? &bounds[part - 1] : nullptr,
+              part < bounds.size() ? &bounds[part] : nullptr);
+      } catch (const std::exception &error) { failures_.Save(error); }
+    }
+    failures_.Check();
   }
 
   static void Remove(const std::string &path) {
@@ -234,16 +292,24 @@ template <size_t Words>
 class ExactSort : public ExactMergeDedup {
  public:
   ExactSort(int workers, uint64_t budget, const std::string &prefix)
-      : directory_(prefix), budget_(budget), keys_(directory_.path, "keys", false, budget, workers, counters_, failures_) {}
+      : directory_(prefix), budget_(budget), workers_(workers), keys_(directory_.path, "keys", false, budget, workers, counters_, failures_) {}
   void AddBase(const uint64_t *key, int worker) override { Add(key, 0, worker); }
   void AddCandidate(const uint64_t *key, uint64_t ordinal) override { Add(key, ordinal, 0); }
+  void AddRecord(const uint64_t *key, uint64_t priority, int worker) override { Add(key, priority, worker); }
+  void FinishUnordered(const std::function<void(const uint64_t *, uint64_t, int)> &emit) override {
+    auto paths = keys_.FinishRuns();
+    keys_.MergeParallel(paths, [&](const Record<Words> &row, int worker) {
+      emit(row.key.data(), row.ordinal, worker);
+    });
+    for (const auto &path : paths) ExternalSorter<Words>::Remove(path);
+  }
   void Check() const override { failures_.Check(); }
   void Finish(const std::function<void(const uint64_t *, uint64_t)> &emit) override {
     auto paths = keys_.FinishRuns();
-    ExternalSorter<Words> order(directory_.path, "order", true, budget_, 1, counters_, failures_);
+    ExternalSorter<Words> order(directory_.path, "order", true, budget_, workers_, counters_, failures_);
     // A base record has ordinal zero, so it wins every equal-key group. All
     // other groups retain the first generated candidate, then regain that order.
-    keys_.Merge(paths, [&](const Record<Words> &row) { if (row.ordinal) order.Add(row, 0); });
+    keys_.MergeParallel(paths, [&](const Record<Words> &row, int worker) { if (row.ordinal) order.Add(row, worker); });
     failures_.Check();
     for (const auto &path : paths) ExternalSorter<Words>::Remove(path);
     auto accepted = order.FinishRuns();
@@ -261,6 +327,7 @@ class ExactSort : public ExactMergeDedup {
   }
   TemporaryRuns directory_;
   uint64_t budget_;
+  int workers_;
   Counters counters_;
   Failures failures_;
   ExternalSorter<Words> keys_;
