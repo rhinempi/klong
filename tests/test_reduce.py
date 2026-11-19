@@ -136,6 +136,20 @@ class ReductionTest(unittest.TestCase):
         output, _ = self.reduce('empty-unique', 21, 29, short, longer, 4, ['--reduce_dedup'])
         self.assertFalse(self.records(output, words))
 
+    def test_post_reduction_dedup_prefers_original_read_count(self):
+        short, words = self.write_edges('source-shards', 5, [
+            [('AACCGG', 1), ('AAGCGT', 7)], [],
+            [('AACCGG', 2), (reverse_complement('AAGCGT'), 2), ('ACAGCC', 2)],
+            [('AACCGG', 2), ('ACAGCC', 2)],
+        ])
+        longer, _ = self.write_edges('empty-longer', 7, [[]])
+        for threads in (1, 4):
+            output, _ = self.reduce('counted-wins-' + str(threads), 5, 7, short, longer, threads,
+                                    ['--reduce_dedup', '--read_counted_shards', '2'])
+            self.assertEqual(self.records(output, words), collections.Counter(
+                pack(canonical(seq), count) for seq, count in
+                [('AACCGG', 1), ('AAGCGT', 7), ('ACAGCC', 2)]))
+
     def test_large_long_shard_uses_multiple_insertion_chunks(self):
         short, words = self.write_edges('short', 21, [[('A' * 22, 17), ('T' * 22, 9)]])
         longer, _ = self.write_edges('long', 29, [[('A' * 30, 2)] * 200003])

@@ -406,6 +406,7 @@ class NativeWorkflowTest(unittest.TestCase):
             current = int(args[args.index('--short_k') + 1])
             next_k = int(args[args.index('--long_k') + 1])
             self.assertEqual(args[args.index('--merge_dedup') + 1], 'sort' if next_k == 59 else 'none')
+            self.assertEqual(args[args.index('--contig_edge_multiplicity') + 1], '2')
             source = output / 'intermediate_contigs/k{}.contigs.fa'.format(current)
             self.assertEqual(args[args.index('--long_contig') + 1], str(source))
             self.assertTrue(all(len(seq) > next_k for seq in fasta(source).values()))
@@ -415,6 +416,7 @@ class NativeWorkflowTest(unittest.TestCase):
         self.assertFalse(list((output / 'intermediate_contigs').glob('*.lt_k*')))
         self.assertFalse(list((output / 'intermediate_contigs').glob('*.ge_k*')))
         for args in reductions[1:]:
+            self.assertEqual(args[args.index('--read_counted_shards') + 1], '1')
             k = args[args.index('--short_k') + 1]
             self.assertEqual(args[args.index('--short_prefix') + 1], str(output / 'tmp/k{}/merged_edges/{}'.format(k,k)))
         handoff = next(args for args in graphs if args[args.index('--output_prefix') + 1]
@@ -458,8 +460,8 @@ class NativeWorkflowTest(unittest.TestCase):
             if key.startswith('assemble-long-only-v2-k'):
                 old = 'assemble-k' + key.split('assemble-long-only-v2-k')[1].split('-to-k')[0]
                 state[old] = state.pop(key)
-            elif key.startswith('merge-deferred-v3-k'):
-                state[key.replace('merge-deferred-v3-k', 'merge-k')] = state.pop(key)
+            elif key.startswith('merge-deferred-multi2-v4-k'):
+                state[key.replace('merge-deferred-multi2-v4-k', 'merge-deferred-v3-k')] = state.pop(key)
             elif key.startswith('reduce-dedup-v3-k'):
                 state[key.replace('reduce-dedup-v3-k', 'reduce-k')] = state.pop(key)
         path.write_text(json.dumps(state))
@@ -468,10 +470,10 @@ class NativeWorkflowTest(unittest.TestCase):
         self.invoke(['--continue', '-o', output])
         state = json.loads(path.read_text())
         self.assertIn('assemble-long-only-v2-k21-to-k39', state)
-        self.assertIn('merge-deferred-v3-k21-k39', state)
+        self.assertIn('merge-deferred-multi2-v4-k21-k39', state)
         self.assertIn('reduce-dedup-v3-k21-k39', state)
         self.assertNotIn('reduce-k21-k39', state)
-        self.assertNotIn('merge-k21-k39', state)
+        self.assertNotIn('merge-deferred-v3-k21-k39', state)
         self.assertTrue(all(len(seq) >= 40 for seq in fasta(output / 'intermediate_contigs/k21.contigs.fa').values()))
 
     @unittest.skipUnless(ZLIB_ONLY, 'set MEGAHIT_TEST_NATIVE_ZLIB to test the no-pigz executable')

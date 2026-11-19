@@ -630,32 +630,35 @@ class Driver {
   }
   std::string reduce(int from, int to) {
     std::string input = from == initial_k() ? graph(from) : reduction_path(from, "merged_edges");
-    if (!exists(input + ".edges.info") && from != initial_k()) input = read_count(from);
+    const bool merged_input = from != initial_k() && exists(input + ".edges.info");
+    if (!merged_input && from != initial_k()) input = read_count(from);
     std::string longer = read_count(to), output = reduction_path(from, "reduced_edges");
     checkpoint("reduce-dedup-v3-k" + number(from) + "-k" + number(to), {output + ".edges.info"}, [&]() {
       if (!exists(input + ".edges.info") || !exists(longer + ".edges.info")) throw Error("Missing reduction input edges");
       clear_edges(output);
-      core({"prefixbf", "--mode", "reduce", "--short_prefix", input, "--long_prefix", longer,
+      Args args{"prefixbf", "--mode", "reduce", "--short_prefix", input, "--long_prefix", longer,
             "--output_prefix", output, "--short_k", number(from), "--long_k", number(to),
             "--num_cpu_threads", number(opt.num_cpu_threads), "--human_readable", "0",
             "--reduce_dedup", "--sort_memory_mb", number(opt.merge_sort_memory),
-            "--max_bloom_gb", "60", "--reserve_gb", "1", "--host_mem", number(host_mem)},
-           "Reduce edges for k = " + number(from) + " using k = " + number(to), true);
+            "--max_bloom_gb", "60", "--reserve_gb", "1", "--host_mem", number(host_mem)};
+      if (merged_input) args.insert(args.end(), {"--read_counted_shards", number(opt.num_cpu_threads)});
+      core(args, "Reduce edges for k = " + number(from) + " using k = " + number(to), true);
     });
     return output;
   }
   void merge_edges(int from, int to) {
     std::string prefix = contig(from), output = reduction_path(to, "merged_edges");
     const bool terminal = to == opt.reduction_k_list.back();
-    checkpoint("merge-deferred-v3-k" + number(from) + "-k" + number(to), {output + ".edges.info"}, [&]() {
+    const std::string stage = terminal ? "merge-terminal-multi2-v4-k" : "merge-deferred-multi2-v4-k";
+    checkpoint(stage + number(from) + "-k" + number(to), {output + ".edges.info"}, [&]() {
       clear_edges(output);
-      core({"prefixbf", "--mode", "merge", "--long_prefix", read_count(to), "--output_prefix", output,
+      Args args{"prefixbf", "--mode", "merge", "--long_prefix", read_count(to), "--output_prefix", output,
             "--long_contig", prefix + ".contigs.fa",
             "--short_k", number(from), "--long_k", number(to), "--num_cpu_threads",
             number(opt.num_cpu_threads), "--human_readable", "0", "--merge_index", opt.merge_index,
             "--merge_dedup", terminal ? opt.merge_dedup : "none", "--sort_memory_mb", number(opt.merge_sort_memory),
-            "--host_mem", number(host_mem)},
-           "Merge k = " + number(from) + " assembly edges into k = " + number(to), true);
+            "--host_mem", number(host_mem), "--contig_edge_multiplicity", "2"};
+      core(args, "Merge k = " + number(from) + " assembly edges into k = " + number(to), true);
     });
   }
   void assemble(int k, const std::string &input, int next = 0) {

@@ -75,6 +75,20 @@ class ExactMergeDedupTest(unittest.TestCase):
         data = Path(str(output) + '.edges.0').read_bytes()
         self.assertTrue(data.startswith(pack('AACCGG', 7) + pack('AACCGG', 19)))
 
+    def test_terminal_multiplicity_changes_only_novel_edges(self):
+        self.fixture(3, 5, [[('AACCGG', 7)]], [], ['AACCGGTTAACC'] * 2)
+        for dedup in ('sort', 'bloom'):
+            output, result = self.run_merge('multi2-' + dedup, dedup=dedup,
+                                            extra=['--contig_edge_multiplicity', '2'])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = oracle(self.shards, self.contigs, self.long_contigs, 3, 6, 4)
+            for i, shard in enumerate(expected):
+                rows = [shard[j:j + 4] for j in range(0, len(shard), 4)]
+                # The first record in shard zero is the unchanged read-counted edge.
+                start = 1 if i == 0 else 0
+                expected_bytes = b''.join(rows[:start] + [b'\x02\x00' + row[2:] for row in rows[start:]])
+                self.assertEqual(Path(str(output) + '.edges.' + str(i)).read_bytes(), expected_bytes)
+
     def test_word_widths_orientations_multiplicity_and_order(self):
         for overlap, k in [(3, 5), (21, 29), (31, 32), (39, 59), (63, 79), (95, 99),
                             (127, 141), (159, 179), (191, 199), (223, 239), (254, 255)]:
@@ -98,18 +112,24 @@ class ExactMergeDedupTest(unittest.TestCase):
     def test_deferred_merge_preserves_duplicate_candidates(self):
         self.fixture(3, 5, [[('AACCGG', 7)]], [], ['AACCGGTTAACC'] * 50)
         for threads in (1, 4, 12):
-            output, result = self.run_merge('deferred-' + str(threads), dedup='none', threads=threads)
+            output, result = self.run_merge('deferred-' + str(threads), dedup='none', threads=threads,
+                                            extra=['--contig_edge_multiplicity', '2'])
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('deferred until reduction', result.stderr)
             self.assertIn('Long-contig extraction:', result.stderr)
             rows = []
             for path in self.root.glob(output.name + '.edges.[0-9]*'):
                 data = path.read_bytes()
+                shard_id = int(path.suffix[1:])
+                if shard_id < threads:
+                    self.assertEqual(data, pack('AACCGG', 7) if shard_id == 0 else b'')
+                else:
+                    self.assertTrue(all(data[i:i + 2] == b'\x02\x00' for i in range(0, len(data), 4)))
                 rows.extend(data[i:i + 4] for i in range(0, len(data), 4))
             expected = [pack('AACCGG', 7)]
             for seq in self.long_contigs:
                 seq = seq[::-1]
-                expected += [pack(canonical(seq[i:i + 6]), 50) for i in range(len(seq) - 5)]
+                expected += [pack(canonical(seq[i:i + 6]), 2) for i in range(len(seq) - 5)]
             self.assertCountEqual(rows, expected)
             self.assertFalse(list(self.root.glob(output.name + '.sort-*')))
 

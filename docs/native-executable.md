@@ -180,8 +180,9 @@ see [Exact Sort-Based Merge Deduplication](merge-sort-dedup.md) for memory/disk
 tradeoffs, measurements, and reproduction commands.
 Intermediate merges now retain duplicate additions without filtering or sorting.
 After reduction, only surviving records are exactly deduplicated into
-`reduced_edges`, retaining the maximum multiplicity for each canonical key.
-This is not a sum of counts. The terminal reduction k has no later reduction,
+`reduced_edges`. Contig-derived edges from each reduction merge have
+multiplicity 2; an existing read-counted edge takes precedence and keeps its
+original count. The terminal reduction k has no later reduction,
 so its merge still uses `--merge-dedup`: exact sorting by default suppresses
 duplicate additions and preserves original base records and counts. Parallel
 extraction, worker-local sorting and key-range merging are described in the

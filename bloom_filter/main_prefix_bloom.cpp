@@ -33,7 +33,6 @@ namespace {
 
 constexpr uint64_t kDefaultMaxBloomBytes = 60ULL * 1024 * 1024 * 1024;
 constexpr uint64_t kSplitMixSeed = 0x9e3779b97f4a7c15ULL;
-constexpr uint32_t kContigEdgeMultiplicity = 50;
 constexpr size_t kEdgeBufferBytes = 1ULL << 20;
 
 struct Options {
@@ -54,7 +53,9 @@ struct Options {
   int human_readable{0};
   std::string merge_index{"hash"};
   std::string merge_dedup{"sort"};
+  unsigned contig_edge_multiplicity{50};
   bool reduce_dedup{false};
+  unsigned read_counted_shards{0};
   double sort_memory_mb{128};
 };
 
@@ -717,7 +718,11 @@ Options ParseOptions(int argc, char **argv) {
   desc.AddOption("human_readable", "", opt.human_readable, "write human-readable debug reports");
   desc.AddOption("merge_index", "", opt.merge_index, "exact contig-end index: fm or hash");
   desc.AddOption("merge_dedup", "", opt.merge_dedup, "merge redundancy filter: bloom, sort, or none");
+  desc.AddOption("contig_edge_multiplicity", "", opt.contig_edge_multiplicity,
+                 "multiplicity assigned to new contig-derived merge edges");
   desc.AddOption("reduce_dedup", "", opt.reduce_dedup, "exact-sort surviving reduced edges, retaining maximum multiplicity");
+  desc.AddOption("read_counted_shards", "", opt.read_counted_shards,
+                 "prefer records from this many leading read-counted shards during reduction deduplication");
   desc.AddOption("sort_memory_mb", "", opt.sort_memory_mb, "exact-sort record buffer budget in MiB");
   desc.Parse(argc, argv);
 
@@ -736,6 +741,8 @@ Options ParseOptions(int argc, char **argv) {
     xfatal("Invalid merge dedup backend or sort memory (minimum 0.0625 MiB)\n");
   if (opt.mode == "merge" && opt.merge_dedup == "sort" && opt.human_readable)
     xfatal("Exact sort currently requires --human_readable 0; per-candidate provenance reports are not supported\n");
+  if (opt.contig_edge_multiplicity == 0 || opt.contig_edge_multiplicity > kMaxMul)
+    xfatal("Invalid contig edge multiplicity; expected 1 to {}\n", kMaxMul);
   if (!std::isfinite(opt.max_bloom_gb) || opt.max_bloom_gb < 0 || opt.max_bloom_gb > 1048576 ||
       !std::isfinite(opt.reserve_gb) || opt.reserve_gb < 0 || opt.reserve_gb > 1048576 ||
       !std::isfinite(opt.host_mem) || opt.host_mem < 0 || opt.host_mem >= 9e18 ||
@@ -766,6 +773,8 @@ int RunReduce(const Options &opt) {
 
   auto long_ranges = ReductionRanges(opt.long_prefix, long_meta, opt.num_threads);
   auto short_ranges = ReductionRanges(opt.short_prefix, short_meta, opt.num_threads);
+  if (opt.read_counted_shards && (!opt.reduce_dedup || opt.read_counted_shards >= short_meta.num_files))
+    throw std::runtime_error("Invalid read-counted shard boundary for reduction deduplication");
 
   uint64_t long_records = TotalRecords(long_meta);
   uint64_t bloom_insertions = long_records * 2;
@@ -830,14 +839,19 @@ int RunReduce(const Options &opt) {
     // The reduction Bloom remains resident while surviving records are sorted.
     if (available) budget = std::min(budget, available > shape.bytes ? (available - shape.bytes) / 4 : 0);
     survivors = MakeExactMergeDedup((short_edge_len + 31) / 32, opt.num_threads, budget, opt.output_prefix);
-    xinfo("Reduced-edge exact dedup: {} workers, {} buffer bytes; maximum multiplicity\n", opt.num_threads, budget);
+    xinfo("Reduced-edge exact dedup: {} workers, {} buffer bytes; {s}\n", opt.num_threads, budget,
+          opt.read_counted_shards ? "prefer read-counted records" : "maximum multiplicity");
   }
-  auto keep_edge = [&](const uint32_t *edge, const KmerKey &forward, int tid) {
+  constexpr uint64_t source_stride = uint64_t{kMaxMul} + 1;
+  auto keep_edge = [&](const uint32_t *edge, const KmerKey &forward, int tid, unsigned file_id) {
     if (!survivors) { writer.Write(edge, tid, "non_removed"); return; }
     ++surviving_records[tid];
     KmerKey reverse = PackedReverseComplement(forward, short_edge_len);
     const auto &key = PackedKeyLess(reverse, forward) ? reverse : forward;
-    survivors->AddRecord(key.words, 65536ULL - Multiplicity(edge, short_meta.words_per_edge), tid);
+    // The sorter keeps the lowest priority value for each key.
+    uint64_t priority = kMaxMul - Multiplicity(edge, short_meta.words_per_edge);
+    if (opt.read_counted_shards && file_id >= opt.read_counted_shards) priority += source_stride;
+    survivors->AddRecord(key.words, priority, tid);
   };
   std::atomic<uint64_t> kept{0};
   std::atomic<uint64_t> removed{0};
@@ -857,7 +871,7 @@ int RunReduce(const Options &opt) {
       KmerKey forward_key = RawKeyFromEdge(edge, 0, short_edge_len);
       bool forward_hit = longer_prefixes.Contains(forward_key);
       if (!forward_hit && !opt.human_readable) {
-        keep_edge(edge, forward_key, tid);
+        keep_edge(edge, forward_key, tid, range.file_id);
         return;
       }
       KmerKey reverse_key = PackedReverseComplement(forward_key, short_edge_len);
@@ -897,7 +911,7 @@ int RunReduce(const Options &opt) {
                                << "NA" << '\n';
         }
       } else {
-        keep_edge(edge, forward_key, tid);
+        keep_edge(edge, forward_key, tid, range.file_id);
         if (!opt.human_readable) return;
         ++kept;
         const char *keep_reason = "no_orientation_hit";
@@ -924,7 +938,7 @@ int RunReduce(const Options &opt) {
       KmerKey key;
       std::copy_n(words, (short_edge_len + 31) / 32, key.words);
       auto &packed = packed_edges[worker];
-      PackKeyAsEdge(key, short_edge_len, short_meta.words_per_edge, 65536ULL - priority, &packed);
+      PackKeyAsEdge(key, short_edge_len, short_meta.words_per_edge, kMaxMul - priority % source_stride, &packed);
       writer.Write(packed.data(), worker, "non_removed");
       ++unique[worker];
     });
@@ -1059,8 +1073,10 @@ int RunMerge(const Options &opt) {
     xfatal("Invalid overlap length {} for long edge length {}\n", overlap_len, edge_len);
   }
 
+  // Keep source provenance in the shard layout without changing edge records.
+  const int candidate_shard_start = opt.merge_dedup == "none" ? opt.num_threads : 0;
   EdgeOutputWriter writer(opt.output_prefix, opt.long_k, base_meta.words_per_edge,
-                          opt.num_threads, opt.human_readable != 0);
+                          opt.num_threads + candidate_shard_start, opt.human_readable != 0);
   uint64_t expected_merge_items = std::max<uint64_t>(1, TotalRecords(base_meta));
   std::unique_ptr<BloomFilter> read_count_edges, emitted_extensions;
   std::unique_ptr<ExactMergeDedup> exact;
@@ -1157,7 +1173,7 @@ int RunMerge(const Options &opt) {
 #pragma omp parallel for schedule(static) num_threads(scan_workers)
     for (unsigned file = 0; file < base_meta.num_files; ++file)
       ForEachEdgeInFile(opt.long_prefix, base_meta, file, [&](const uint32_t *edge) {
-        writer.Write(edge, file, "read_count_base");
+        writer.Write(edge, file % opt.num_threads, "read_count_base");
       });
   }
 
@@ -1175,7 +1191,7 @@ int RunMerge(const Options &opt) {
                        [&](const uint32_t *edge) {
         ++matches.records;
         if (!exact && !read_count_edges && !overlap_queries) {
-          if (write_base) writer.Write(edge, range.file_id, "read_count_base");
+          if (write_base) writer.Write(edge, range.file_id % opt.num_threads, "read_count_base");
           return;
         }
         KmerKey forward = RawKeyFromEdge(edge, 0, edge_len);
@@ -1191,7 +1207,7 @@ int RunMerge(const Options &opt) {
           if (opt.human_readable && read_count_edges->Contains(key)) ++matches.duplicates;
           read_count_edges->Add(key);
         }
-        if (write_base) writer.Write(edge, range.file_id, "read_count_base");
+        if (write_base) writer.Write(edge, range.file_id % opt.num_threads, "read_count_base");
 
         if (overlap_queries) {
           match_orientation(forward);
@@ -1265,8 +1281,9 @@ int RunMerge(const Options &opt) {
       ++extended_windows_seen;
       if (exact) { exact->AddCandidate(key.words, extended_windows_seen); continue; }
       if (!read_count_edges) {
-        PackKeyAsEdge(key, edge_len, base_meta.words_per_edge, kContigEdgeMultiplicity, &packed);
-        writer.Write(packed.data(), extended_edges_added++ % opt.num_threads, "contig_overlap_extension");
+        PackKeyAsEdge(key, edge_len, base_meta.words_per_edge, opt.contig_edge_multiplicity, &packed);
+        writer.Write(packed.data(), candidate_shard_start + extended_edges_added++ % opt.num_threads,
+                     "contig_overlap_extension");
         continue;
       }
       const char *duplicate_source = nullptr;
@@ -1278,7 +1295,7 @@ int RunMerge(const Options &opt) {
       if (duplicate_source != nullptr) {
         ++extended_edges_duplicate;
         if (opt.human_readable) contig_report << BasesFromKey(key, edge_len) << '\t'
-                      << kContigEdgeMultiplicity << "\tduplicate\t"
+                      << opt.contig_edge_multiplicity << "\tduplicate\t"
                       << contig_name << '\t' << direction << '\t'
                       << long_edge << '\t' << extension_offset << '\t'
                       << duplicate_source << '\n';
@@ -1286,12 +1303,12 @@ int RunMerge(const Options &opt) {
       }
       emitted_extensions->Add(key);
       PackKeyAsEdge(key, edge_len, base_meta.words_per_edge,
-                    kContigEdgeMultiplicity, &packed);
+                    opt.contig_edge_multiplicity, &packed);
       writer.Write(packed.data(), extended_edges_added % opt.num_threads,
                    "contig_overlap_extension");
       ++extended_edges_added;
       if (opt.human_readable) contig_report << BasesFromKey(key, edge_len) << '\t'
-                    << kContigEdgeMultiplicity << "\tadded\t"
+                    << opt.contig_edge_multiplicity << "\tadded\t"
                     << contig_name << '\t' << direction << '\t'
                     << long_edge << '\t' << extension_offset << "\t.\n";
     }
@@ -1366,8 +1383,8 @@ int RunMerge(const Options &opt) {
               ++windows[worker];
               if (exact) exact->AddRecord(key.words, input.ordinal + i, worker);
               else {
-                PackKeyAsEdge(key, edge_len, base_meta.words_per_edge, kContigEdgeMultiplicity, &packed);
-                writer.Write(packed.data(), worker, "long_contig_window");
+                PackKeyAsEdge(key, edge_len, base_meta.words_per_edge, opt.contig_edge_multiplicity, &packed);
+                writer.Write(packed.data(), candidate_shard_start + worker, "long_contig_window");
               }
             }
           } catch (...) { errors[worker] = std::current_exception(); }
@@ -1404,7 +1421,7 @@ int RunMerge(const Options &opt) {
     exact->Finish([&](const uint64_t *words, uint64_t ordinal) {
       KmerKey key;
       std::copy_n(words, active_words, key.words);
-      PackKeyAsEdge(key, edge_len, base_meta.words_per_edge, kContigEdgeMultiplicity, &packed);
+      PackKeyAsEdge(key, edge_len, base_meta.words_per_edge, opt.contig_edge_multiplicity, &packed);
       writer.Write(packed.data(), extended_edges_added % opt.num_threads, "contig_overlap_extension");
       ++extended_edges_added;
       if (ordinal > long_candidate_start) ++long_contig_edges_added;
@@ -1470,7 +1487,7 @@ int RunMerge(const Options &opt) {
   summary << "extended_windows_seen\t" << extended_windows_seen << '\n';
   summary << "extended_edges_added\t" << extended_edges_added << '\n';
   summary << "extended_edges_duplicate\t" << extended_edges_duplicate << '\n';
-  summary << "contig_edge_multiplicity\t" << kContigEdgeMultiplicity << '\n';
+  summary << "contig_edge_multiplicity\t" << opt.contig_edge_multiplicity << '\n';
   summary << "output_edges_total\t" << base_added + extended_edges_added << '\n';
     summary << "representation\tbinary_edges_read_count_plus_exact_k_overlap_extensions_bloom_redundancy_filter\n";
   }

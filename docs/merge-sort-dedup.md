@@ -5,9 +5,10 @@ reduction. With the default 21,29,39,59 list, `k29/merged_edges` and
 `k39/merged_edges` retain duplicates without Bloom filtering or sorting. Only
 surviving records enter an exact external sorter and are written directly to
 `kN/reduced_edges` before graph construction. Reverse complements share one
-canonical packed key. Duplicate survivors retain their **maximum multiplicity**,
-not the sum, matching SdBG's duplicate-edge count rule. This differs from the old
-early-merge rule, which favored a read-counted record even when its count was lower.
+canonical packed key. Intermediate merges write read-counted and generated edges
+to separate shards. When both sources supply the same surviving edge, reduction
+deduplication keeps the original read count, even if it is below 2. Within a
+source, duplicate survivors keep the maximum multiplicity, not the sum.
 
 The last reduction k (normally k59) has no subsequent reduction. Its
 `merged_edges` still uses the configured merge backend, exact sort by default,
@@ -69,8 +70,9 @@ to preserve historical output order. FASTA parsing and each individual
    any candidate already present in the input. Otherwise retain the earliest
    candidate for each key. Multi-pass merging opens at most 32 input runs per worker.
 6. Sort accepted candidates by their retained ordinals and emit them in original
-   generation order, with the existing multiplicity 50 and round-robin shard
-   assignment.
+   generation order, with round-robin shard assignment. All native reduction
+   merges assign generated edges multiplicity 2. Standalone core merges
+   default to 50 unless overridden.
 
 Records store only active 64-bit sequence words plus one ordinal: 16 bytes at
 k29 and 24 bytes at k39/k59. Neither merge Bloom filter is allocated. Base input
