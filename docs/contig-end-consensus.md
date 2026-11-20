@@ -5,19 +5,19 @@ The production workflow is now native C++ and does not require Python. See
 Python driver remains in the source tree only for regression comparison;
 its numbered checkpoints cannot be resumed by the native driver.
 
-After the reduction/merge pass ends at k59, consensus local contigs from k59
-and the full k59 contigs, bubbles, and additional contigs seed a fresh k21
-SdBG. This seed graph does not reuse first-pass read-count edges. The flanking
+After descending reduction assembly ends at k21 by default, its consensus
+local contigs, full contigs, bubbles, and additional contigs seed a fresh k21
+SdBG. This seed graph does not reuse first-pass reduced or read-counted edges. The flanking
 pass then assembles the full configured k-list, by default
 21,31,41,61,81,101,141. First-pass files remain unchanged.
 
 At the handoff and every subsequent flanking transition, the consensus stage runs:
 
-1. Extract contig ends to `OUT_DIR/tmp/k59/k59.contig_ends.fa`.
+1. Extract contig ends to `OUT_DIR/tmp/k21/k21.contig_ends.fa` for the default handoff.
 2. Map merged and unmerged FLASH gzip FASTA exports listed in `assembly_inputs.json` to that file with Minimap2.
 3. Build outward consensus extensions in native C++.
-4. Publish extended records as `intermediate_contigs/k59.local.fa` and its info file.
-5. At the handoff, build the k21 seed graph from the k59 sequences. Thereafter,
+4. Publish extended records as `intermediate_contigs/k21.local.fa` and its info file.
+5. At the handoff, build the flanking seed graph from the smallest reduction k's sequences. Thereafter,
    extract iterative edges and build the next SdBG with the new local-contig
    input, following the configured flanking list through k141. With
    `--flanking-consensus-only`, no read-derived iterative edges are added.
@@ -35,26 +35,25 @@ disables this preprocessing and FLASH-based consensus; without these inputs the
 local FASTA is empty and its info file is `0 0`. There is no automatic fallback to
 IDBA. `--no-local` disables local-contig publication and graph input entirely.
 The old core `local` subcommand remains available for standalone use but is
-not called by the launcher. Custom k-lists restart at their configured minimum
-after their last reduction k; workflows starting above k60 retain their normal
-increasing-k path without a reduction handoff. Use a fresh output directory
-when switching from the old workflow; old checkpoint numbers are incompatible.
+not called by the launcher. Custom lists start flanking at the first flanking k,
+which can differ from the smallest reduction k used as the source. Workflows
+without a reduction list retain their increasing-k path without a handoff.
 
 ## Files
 
 ```text
-tmp/k59/k59.contig_ends.fa
-tmp/k59/k59.contig_ends.extended.fa
-tmp/k59/k59.contig_ends.extended.fa.info
-tmp/k59/flank_mapping/library.N.sam
-tmp/k59/flank_mapping/mapping.json
-tmp/k59/flank_mapping/consensus.tsv
-tmp/k59/flank_mapping/consensus.json
-intermediate_contigs/k59.local.fa
-intermediate_contigs/k59.local.fa.info
+tmp/k21/k21.contig_ends.fa
+tmp/k21/k21.contig_ends.extended.fa
+tmp/k21/k21.contig_ends.extended.fa.info
+tmp/k21/flank_mapping/library.N.sam
+tmp/k21/flank_mapping/mapping.json
+tmp/k21/flank_mapping/consensus.tsv
+tmp/k21/flank_mapping/consensus.json
+intermediate_contigs/k21.local.fa
+intermediate_contigs/k21.local.fa.info
 ```
 
-The source is `intermediate_contigs/k59.contigs.fa`. Contigs >=580 bases produce
+The default handoff source is `intermediate_contigs/k21.contigs.fa`. Contigs >=580 bases produce
 `original_name|start` and `original_name|end` fragments of 290 bases. Shorter
 contigs retain the entire original sequence and header. Extracted fragments
 remain in the original contig orientation. All output above remains under the
@@ -70,7 +69,7 @@ They also report uncapped `support_reads`, `reference_length`, `left_extension`,
 per-base pileup depth. The TSV still covers all reference fragments
 for diagnostics, including those omitted from the FASTA.
 
-`k59.local.fa` and its `.info` file are copies of the extended FASTA and its
+`k21.local.fa` and its `.info` file are copies of the extended FASTA and its
 `.info`. Each info file stores `<record_count> <sum_of_sequence_lengths>` followed
 by a newline. Zero extensions produce an empty FASTA and `0 0` metadata. The
 next graph builder applies its usual minimum sequence length of next_k + 1.

@@ -1,4 +1,5 @@
 #include "platform.h"
+#include "end_anchors.h"
 #include <cstring>
 #include <iostream>
 
@@ -12,6 +13,16 @@ int main(int argc, char **argv) {
     if (argc != 4) return 2;
     try { native::decompress(argv[2], argv[3]); return 0; }
     catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
+  }
+  if (argc > 1 && std::strcmp(argv[1], "--native-restore-anchors") == 0) {
+    if (argc < 7 || argc > 13 || (argc >= 12 && std::strcmp(argv[11], "best") != 0)) return 2;
+    try {
+      native::restore_end_anchors(argv[2], argv[3], argv[4], std::stoul(argv[5]), std::stoul(argv[6]),
+                                  argc >= 8 ? std::stoi(argv[7]) : 1,
+                                  argc >= 9 ? std::stoi(argv[8]) : -1, argc >= 10 ? argv[9] : "",
+                                  argc >= 11 ? argv[10] : "", argc >= 12, argc == 13 ? std::stoi(argv[12]) : 0);
+      return 0;
+    } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
   }
   if (argc > 1 && std::strcmp(argv[1], "--native-info") == 0) {
     std::cout << native::Json({{"workflow", "native-cpp"}, {"python_required", false},

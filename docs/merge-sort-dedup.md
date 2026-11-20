@@ -1,6 +1,10 @@
 # Exact Sort-Based Merge Deduplication
 
-The native workflow defers intermediate merge deduplication until after
+The current [native workflow](native-executable.md) uses exact sorting for
+`reduced_edges` but no longer runs the edge merge described below.
+`--merge-sort-memory` still controls reduced-edge sort buffers.
+
+The previous forward-only workflow deferred intermediate merge deduplication until after
 reduction. With the default 21,29,39,59 list, `k29/merged_edges` and
 `k39/merged_edges` retain duplicates without Bloom filtering or sorting. Only
 surviving records enter an exact external sorter and are written directly to
@@ -10,12 +14,13 @@ to separate shards. When both sources supply the same surviving edge, reduction
 deduplication keeps the original read count, even if it is below 2. Within a
 source, duplicate survivors keep the maximum multiplicity, not the sum.
 
-The last reduction k (normally k59) has no subsequent reduction. Its
-`merged_edges` still uses the configured merge backend, exact sort by default,
-with the original base-record preservation rule described below:
+In that workflow, the last reduction k (normally k59) had no subsequent
+reduction. Its `merged_edges` used the configured merge backend, exact sort
+by default, with the original base-record preservation rule described below.
+To select the standalone core's exact merge backend:
 
 ```sh
-megahit --merge-dedup sort --merge-sort-memory 128 [normal input/output options]
+megahit --core prefixbf --mode merge --merge_dedup sort --sort_memory_mb 128 [edge and contig inputs]
 ```
 
 `--merge-sort-memory` is the total record-buffer budget in MiB, shared by sorting
@@ -23,16 +28,11 @@ workers, not a per-worker budget. Its default is 128 MiB and its minimum is
 0.0625 MiB. The budget is capped at one quarter of the smaller visible available
 memory and workflow `-m` budget. Indexes, overlap matches, I/O buffers, merge
 cursors, and runtime overhead are additional; this is not an enforced process
-RSS limit. Native reduction merges now use only long contigs and build no overlap
-index. `--merge-index hash|fm` remains relevant to the standalone core's legacy
-short-contig overlap mode, not to native long-only reduction merges.
+RSS limit. The standalone core's legacy short-contig overlap mode can still use
+`--merge_index hash|fm`.
 
-Bloom remains selectable with `--merge-dedup bloom`.
-The selection is saved in `options.json`; resume uses saved options and existing
-checkpoints. Older native runs without a saved selection retain historical Bloom
-deduplication for their terminal merge. Use a fresh output directory to compare
-backends. Intermediate reduced outputs always use exact sorting. The option does
-not change the separate k-mer reduction Bloom filter.
+Bloom remains selectable in standalone merge mode with `--merge_dedup bloom`.
+This option does not change the separate k-mer reduction Bloom filter.
 The installed native executable still requires no Python, GNU sort, or other
 external sorting program.
 
@@ -70,9 +70,8 @@ to preserve historical output order. FASTA parsing and each individual
    any candidate already present in the input. Otherwise retain the earliest
    candidate for each key. Multi-pass merging opens at most 32 input runs per worker.
 6. Sort accepted candidates by their retained ordinals and emit them in original
-   generation order, with round-robin shard assignment. All native reduction
-   merges assign generated edges multiplicity 2. Standalone core merges
-   default to 50 unless overridden.
+   generation order, with round-robin shard assignment. Standalone core merges
+   assign generated edges multiplicity 50 unless overridden.
 
 Records store only active 64-bit sequence words plus one ordinal: 16 bytes at
 k29 and 24 bytes at k39/k59. Neither merge Bloom filter is allocated. Base input

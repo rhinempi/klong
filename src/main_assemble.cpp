@@ -27,6 +27,7 @@
 #include <string>
 
 #include "assembly/all_algo.h"
+#include "assembly/anchor_paths.h"
 #include "assembly/contig_output.h"
 #include "assembly/contig_stat.h"
 #include "utils/histgram.h"
@@ -57,6 +58,9 @@ struct LocalAsmOption {
   int cleaning_rounds{5};
   bool output_standalone{false};
   bool careful_bubble{false};
+  string anchor_source, anchor_path_report, anchor_threaded_contigs;
+  int anchor_end_length{0};
+  bool anchor_stitched_only{false};
 
   string contig_file() { return output_prefix + ".contigs.fa"; }
   string standalone_file() { return output_prefix + ".final.contigs.fa"; }
@@ -101,12 +105,27 @@ void ParseAsmOption(int argc, char *argv[]) {
                  "output standalone contigs to *.final.contigs.fa");
   desc.AddOption("careful_bubble", "", opt.careful_bubble,
                  "remove bubble carefully");
+  desc.AddOption("anchor_source", "", opt.anchor_source,
+                 "source contig FASTA for exact graph path reporting");
+  desc.AddOption("anchor_end_length", "", opt.anchor_end_length,
+                 "length of each end of a stitched anchor");
+  desc.AddOption("anchor_path_report", "", opt.anchor_path_report,
+                 "TSV of exact anchor paths in the cleaned graph");
+  desc.AddOption("anchor_threaded_contigs", "", opt.anchor_threaded_contigs,
+                 "FASTA of exact anchor paths with unambiguous graph flanks");
+  desc.AddOption("anchor_stitched_only", "", opt.anchor_stitched_only,
+                 "thread stitched anchors only; route whole short contigs to raw unitigs");
 
   try {
     desc.Parse(argc, argv);
     if (opt.min_contig_len < 0) throw std::logic_error("Minimum output contig length cannot be negative");
     if (opt.sdbg_name.empty()) {
       throw std::logic_error("no succinct de Bruijn graph name!");
+    }
+    if ((!opt.anchor_source.empty() || !opt.anchor_path_report.empty() || !opt.anchor_threaded_contigs.empty() ||
+         opt.anchor_end_length != 0 || opt.anchor_stitched_only) &&
+        (opt.anchor_source.empty() || opt.anchor_path_report.empty() || opt.anchor_end_length <= 0)) {
+      throw std::logic_error("Anchor path reporting requires --anchor_source, --anchor_end_length, and --anchor_path_report");
     }
   } catch (std::exception &e) {
     std::cerr << e.what() << std::endl;
@@ -257,10 +276,26 @@ int main_assemble(int argc, char **argv) {
   // output contigs
   ContigWriter contig_writer(opt.contig_file());
   ContigWriter standalone_writer(opt.standalone_file());
+  const auto report_anchor_paths = [&]() {
+    if (opt.anchor_path_report.empty()) return;
+    SimpleTimer report_timer;
+    report_timer.start();
+    const auto paths = WriteAnchorPathReport(dbg, opt.anchor_source, opt.anchor_end_length,
+                                             opt.anchor_path_report, opt.anchor_threaded_contigs,
+                                             opt.anchor_stitched_only);
+    report_timer.stop();
+    xinfo("Exact graph anchor paths: {}/{} full, {} cross a branch; time: {}\n",
+          paths.found, paths.queries, paths.crossing_branches, report_timer.elapsed());
+    if (!opt.anchor_threaded_contigs.empty()) {
+      xinfo("Threaded anchor contigs: {} emitted, {} extended, {} flank bases\n",
+            paths.found, paths.extended, paths.added_nt);
+    }
+  };
 
   if (!(opt.is_final_round &&
         opt.prune_level >=
             1)) {  // otherwise output after local low depth pruning
+    report_anchor_paths();
     timer.reset();
     timer.start();
 
@@ -296,6 +331,7 @@ int main_assemble(int argc, char **argv) {
     if (!opt.is_final_round) {
       OutputContigs(graph, &addi_contig_writer, nullptr, true, 0, opt.min_contig_len);
     } else {
+      report_anchor_paths();
       OutputContigs(graph, &contig_writer,
                     opt.output_standalone ? &standalone_writer : nullptr, false,
                     opt.min_standalone, opt.min_contig_len);

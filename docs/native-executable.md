@@ -89,9 +89,10 @@ megahit -1 R1.fq.gz -2 R2.fq.gz --merge-pairs -o output \
 
 Each list must be strictly increasing, with odd values in [15,255]. Adjacent
 reduction steps may be at most 28; flanking steps may be at most 40. Explicit
-reduction lists are not restricted to k<=60. The last reduction assembly and its
-consensus extensions seed a fresh graph at the first flanking k, which may differ
-from the first reduction k. The same 290-base end extraction, Minimap2
+reduction lists are not restricted to k<=60. The lists are supplied in ascending
+order; the reduction phase assembles them in descending order. The resulting
+smallest-k assembly and its consensus extensions seed a fresh graph at the first
+flanking k, which may differ from the first reduction k. The same 290-base end extraction, Minimap2
 parameters, extended-only consensus local files, and binary edge formats are used.
 Final contigs are filtered and merged in C++ without shell pipelines.
 
@@ -101,6 +102,128 @@ A phase-specific list overrides that phase regardless of CLI option order.
 Explicit phase lists and the new defaults are not shortened based on read length.
 Both lists are saved in `options.json`; continuation restores them. Older native
 runs without these fields retain their historical shared-list behavior.
+
+### Experimental End Anchors
+
+End anchoring is off by default. Standard flanking builds each SdBG from
+the complete prior contigs, not stitched anchors. This also applies with
+`--flanking-consensus-only`: consensus still uses read mapping at real contig
+ends, but those mapping windows do not replace the full graph inputs. To
+switch an earlier anchored run to the standard workflow, start in a fresh
+output directory and omit the end-anchor and `--anchor-*` options.
+
+`--flanking-end-anchors` makes flanking extend or join saved contigs rather than
+reassemble their full lengths. For example, to preserve the k31 reduction
+assembly while trying extension at k21:
+
+```sh
+megahit -1 R1.fq.gz -2 R2.fq.gz -o anchored \
+  --reduction-k-list 31,41,51 --flanking-end-anchors \
+  --flanking-consensus-only --keep-tmp-files
+```
+
+Each flanking end anchor is 290 nt. Contigs longer than 580 nt supply one
+stitched record with the first and last 290 nt. Contigs at or below 580 nt
+supply their full sequence to the same SdBG and can extend through consensus
+edges. Circular contigs are retained unchanged. Reads are still
+mapped to real contig ends. The extension SdBG receives stitched anchors,
+trimmed outward consensus, and, for later iterations when enabled, iterative
+edges indexed from the stitched anchors. It does not receive previous bubble
+or additional-contig sequences.
+
+The synthetic FASTA and raw SdBG unitigs are scratch files under
+`tmp/flanking/kN/`; `--keep-tmp-files` retains them. Flanking uses the raw
+unitigs by default. The matcher selects one best full hit per anchor, on
+either strand, favoring fewer substitutions and then longer unitigs.
+Ties are resolved deterministically rather than rejected. Non-overlapping
+hits on the same unitig are restored together: each anchor is replaced with
+its full original in the matching orientation, and the intervening sequences
+are copied once. A contig without a selected placement is retained unchanged.
+An unselected stitched-anchor junction or an ambiguous base can still stop a
+bridge. There is no independent validation of joins. The usual final length
+filter still applies.
+Restoration packs DNA at two bits per base. Exact 16-base seeds identify
+candidates for full packed comparisons; OpenMP scans batches of candidates
+with up to `-t` workers. The best hit is chosen across all batches and both
+strands before the restored FASTA is written in source order.
+Repetitive anchors may be hard to recover intact at low k, so this mode can
+preserve contiguity at the cost of accepting fewer extensions.
+
+Add `--anchor-max-mismatches 0` to either anchor mode to report approximate
+matches without changing restoration. Overlapping 12-base seeds find
+candidates on both strands; packed comparisons count substitutions over the
+ungapped overlap. `kN.anchor-matches.tsv` is written next to the restored
+contigs. It reports the best full match and best fragment when found, including
+the aligned length, substitutions, and unaligned bases separately. A fragment
+requires at least 24 aligned bases, and reported matches have at least 90%
+identity. A no-hit result can mean there was no shared seed, not that every
+base mismatched. This search is also parallel by candidate sequence, but a
+repetitive seed can generate many candidate offsets before deduplication.
+It does not model indels or stitch across candidates.
+
+Values `1` through `8` also allow restoration from a best full
+placement within that substitution limit, provided both outer k-mers match
+exactly. Partial hits never trigger restoration, and the original contig
+sequence is always inserted unchanged.
+
+For a gapped alternative, use `--flanking-end-anchors --anchor-min-identity 30`
+with graph threading off. Exact matches still win at 100%. Otherwise, the
+bundled Edlib aligner aligns the whole anchor, on both strands, to a substring
+of each eligible raw unitig. The best edit-distance alignment from each search
+is ranked by identity: identical bases divided by all alignment columns,
+including substitutions and gaps. Restoration replaces the aligned **target**
+span with the original contig, so insertions and deletions do not shift the
+splice coordinates. `kN.anchor-alignments.tsv` reports identity, target span,
+gaps, and whether the hit was restored. The mode is parallel by anchor but is
+more expensive than exact matching. A 30% cutoff can accept unrelated
+alignments and should be used experimentally. Do not combine this option with
+`--anchor-max-mismatches` or `--anchor-graph-thread`.
+
+`--anchor-graph-report` checks whether each complete anchor spells an exact
+path in the cleaned SdBG, including across unitig boundaries. The assembler
+looks up the first k-mer, then follows the surviving edge that matches each
+next base. Queries run in parallel without building a separate unitig index.
+The `kN.anchor-graph-paths.tsv` report beside the restored contigs shows the
+matched prefix length and branch crossings. A full path does not establish
+that an outward extension is unique. The report itself does not change restoration.
+The report uses the graph snapshot that produces the primary `.contigs.fa`,
+not the later `.addi.fa` for non-final iterations.
+
+`--anchor-graph-thread` is off by default. It writes
+both the graph path report and `kN.anchor-threaded.fa`. In flanking, only
+stitched anchors are threaded. Restoration matches those against the threaded
+FASTA, and matches whole contigs of 580 nt or less against the raw SdBG
+unitigs. These shorter contigs are marked `raw_unitig` in the graph path
+report. Short and long placements are evaluated separately; a complete
+stitched-anchor match in a raw unitig also blocks copying through that anchor
+during short-contig restoration.
+In the threaded FASTA, several records can cover the same exact anchor path.
+When one exact hit contains every other hit at the aligned anchor position,
+restoration uses the anchor's own exported record and
+does not count the other copies as competing placements. Conflicting paths
+and repeated hits within one record remain ambiguous. Other records retain
+their own anchors and are not removed from the FASTA.
+Use `--no-anchor-graph-thread` to explicitly select raw-unitig restoration,
+or `--anchor-graph-report` to keep only the TSV. Neither flag enables end-anchor
+assembly by itself. A FASTA record is emitted only when the graph spells the
+full anchor. Its sequence is spelled from the graph, with any left or right
+flank extended through unique links until a branch, dead end, or edge reuse.
+The FASTA retains synthetic stitches: only the restored contigs with their
+original interiors reinserted are carried forward. In the descending
+reduction phase, threaded paths are diagnostic only and restoration continues
+to use the raw unitigs.
+
+`--reduction-end-anchors` independently applies the same restoration to the
+descending reduction pass. Ascending counting/reduction and the largest-k
+assembly are unchanged. Each smaller k's SdBG uses the preceding larger-k
+contig anchors and the target k's `reduced_edges`, without consensus or
+iterative read edges. Anchor length is at least 100 nt and covers the maximum
+of both configured k lists. Unitigs with no anchor match stay in the raw graph
+assembly and are not exported or carried into the next round. Use both
+end-anchor flags to preserve the original sequences
+through both phases; ordinary flanking rebuilds its graph from whole contigs.
+Reduction anchors and raw unitigs are kept under `tmp/kN/assembly_graph/`
+when using `--keep-tmp-files`.
 
 `--flanking-consensus-only` skips read-derived iterative `.edges.*` generation
 throughout the flanking pass. Each new SdBG instead uses retained contigs,
@@ -152,43 +275,29 @@ consensus and downstream stages; changed mapping parameters invalidate cached
 secondary-enabled SAM. Already completed runs still remain completed on `--continue`;
 use a fresh output directory to rebuild them with the new consensus behavior.
 
-Look-ahead counting retains only binary `.edges.*` files; it does not build a
-preliminary read-counted SdBG. Reduction and merging consume those edges directly.
-SdBG construction occurs only for the reduced/merged edges that will be assembled
-and for the subsequent flanking assembly graphs. Native checkpoints from earlier
-versions remain usable; obsolete read-counted graph checkpoints are ignored.
+**Reduction and descending assembly.** For a list such as `21,31,41,51`,
+count read edges in ascending order and reduce each smaller k against the next
+larger's read-counted edges. All reductions finish before any SdBG is built.
+Assemble k51 directly from its counted edges. Then build k41 from the k51 main
+contigs and k41 reduced edges, k31 from the k41 main contigs and k31 reduced
+edges, and k21 from the k31 main contigs and k21 reduced edges. These steps use
+the normal `seq2sdbg` contig input, including contig-header multiplicities, and
+standard assembly cleaning. No `merged_edges`, mapping, consensus, or iterative
+read-edge extraction is used during the descent.
+
 Reduction uses bounded block I/O, packed-word operations, and chunk-based workers;
-its Bloom allocation now receives the workflow memory budget. See
+its Bloom allocation receives the workflow memory budget. Surviving reduced edges
+are exactly deduplicated using buffers sized by `--merge-sort-memory`. See
 [Edge Reduction Performance](reduction-performance.md) for parameters and benchmarks.
 Assembly skips unused depth inference, uses thread-private histograms, avoids
 no-change refreshes, and checks changed-only output before sequence reconstruction.
 See [Assembly Performance](assembly-performance.md) for details and comparison commands.
-Intermediate reduction assemblies output only contigs longer than the next k
-(for example, at least 30 bp for k21 -> k29). The merge extracts packed
-(next-k+1)-mer windows directly from those contigs and combines them with the
-read-counted next-k edges. It no longer writes short/long split FASTA files or
-searches short-contig ends against the next-k edges; no overlap index is built.
-The final reduction assembly retains its usual output lengths. Its input is the
-last `merged_edges` set, which includes the preceding assembly's novel edges;
-this set is not generally redundant with `read_count`.
-
-`--merge-index hash|fm` remains accepted for compatibility, but has no effect on
-these long-only merges. The standalone core merge still supports short-contig
-matching; see [Contig-End FM Index](merge-fm-index.md) for that mode's benchmarks.
-The default `--merge-dedup sort` replaces merge Bloom filtering with exact external sorting;
-see [Exact Sort-Based Merge Deduplication](merge-sort-dedup.md) for memory/disk
-tradeoffs, measurements, and reproduction commands.
-Intermediate merges now retain duplicate additions without filtering or sorting.
-After reduction, only surviving records are exactly deduplicated into
-`reduced_edges`. Contig-derived edges from each reduction merge have
-multiplicity 2; an existing read-counted edge takes precedence and keeps its
-original count. The terminal reduction k has no later reduction,
-so its merge still uses `--merge-dedup`: exact sorting by default suppresses
-duplicate additions and preserves original base records and counts. Parallel
-extraction, worker-local sorting and key-range merging are described in the
-deduplication document above. Versioned reduction and merge checkpoints rebuild the
-affected stages of incomplete older runs. Completed runs remain completed on
-`--continue`; use a fresh output directory to rebuild them with this behavior.
+`--merge-index` and `--merge-dedup` are accepted for native CLI and checkpoint
+compatibility but no longer affect the workflow. The standalone core merge
+remains available. Incomplete runs with older forward-merge checkpoints reuse
+eligible count stages and rebuild the changed stages without reading old
+`merged_edges`. Completed runs remain completed on `--continue`; use a fresh
+output directory to rebuild them with this behavior.
 
 Native runs write `options.json` with `workflow_driver: native-cpp-v1` and
 `checkpoints.native.json`. Resume validates input paths, sizes, and modification

@@ -1,23 +1,21 @@
 # Contig-End FM Index
 
-Native reduction now retains only contigs longer than next-k and extracts their
-edges directly, without short-contig matching or an overlap index. The native
-`--merge-index` setting remains accepted and saved for compatibility, but does
-not affect these long-only merges. The implementation and historical benchmarks
-below apply to the standalone core's optional short-contig overlap mode.
+Native reduction now builds descending SdBGs directly from contigs and reduced
+edges; it does not run an edge merge or use an overlap index. The native
+`--merge-index` setting remains accepted for compatibility. The implementation
+and historical benchmarks below apply to the standalone core's optional
+short-contig overlap mode.
 
 The merge stage supports two interchangeable exact-overlap dictionaries:
 
 ```sh
-megahit --merge-index fm [other assembly options]
-megahit --merge-index hash [other assembly options]
+megahit --core prefixbf --mode merge --merge_index fm [edge and contig inputs]
+megahit --core prefixbf --mode merge --merge_index hash [edge and contig inputs]
 ```
 
 Hash remains the default: measurements below do not justify a blanket switch to
 FM for fixed-length exact overlap. The FM backend replaces the query hash tables
 when selected, rather than adding an approximate or alignment-based lookup.
-The setting is stored in native `options.json`. A resumed run uses its saved
-options and existing checkpoints.
 
 ## FM Representation
 

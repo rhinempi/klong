@@ -462,17 +462,18 @@ SeqToSdbg::MemoryStat SeqToSdbg::Initialize() {
         seq_pkg_.size_in_byte(), seq_pkg_.seq_count(), seq_pkg_.base_count(),
         multiplicity.size(), multiplicity.capacity());
 
-    // read bubble
-    ContigReader bubble_reader(opt_.bubble_seq);
-    bubble_reader.SetMinLen(opt_.k + 1);
-    n_read = bubble_reader.ReadAllWithMultiplicity(&seq_pkg_, &multiplicity,
-                                                   contig_reverse);
-    xinfo("Read {} contigs from {}.\n", n_read, opt_.bubble_seq.c_str());
-    xinfo(
-        "After reading contigs, sizeof seq_package: {}/{}/{}, multiplicity "
-        "vector: {}/{}\n",
-        seq_pkg_.size_in_byte(), seq_pkg_.seq_count(), seq_pkg_.base_count(),
-        multiplicity.size(), multiplicity.capacity());
+    if (!opt_.bubble_seq.empty()) {
+      ContigReader bubble_reader(opt_.bubble_seq);
+      bubble_reader.SetMinLen(opt_.k + 1);
+      n_read = bubble_reader.ReadAllWithMultiplicity(&seq_pkg_, &multiplicity,
+                                                     contig_reverse);
+      xinfo("Read {} contigs from {}.\n", n_read, opt_.bubble_seq.c_str());
+      xinfo(
+          "After reading contigs, sizeof seq_package: {}/{}/{}, multiplicity "
+          "vector: {}/{}\n",
+          seq_pkg_.size_in_byte(), seq_pkg_.seq_count(), seq_pkg_.base_count(),
+          multiplicity.size(), multiplicity.capacity());
+    }
   }
 
   if (!opt_.addi_contig.empty()) {

@@ -1,4 +1,5 @@
 #include "platform.h"
+#include "end_anchors.h"
 
 #include <algorithm>
 #include <chrono>
@@ -15,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "assembly/anchor_paths.h"
 #include "definitions.h"
 #include "minimap2/minimap.h"
 
@@ -69,6 +71,12 @@ struct Options {
   bool legacy_k_list = false;
   bool reduction_k_list_set = false, flanking_k_list_set = false;
   bool flanking_consensus_only = false;
+  bool flanking_end_anchors = false;
+  bool reduction_end_anchors = false;
+  bool anchor_graph_report = false;
+  bool anchor_graph_thread = false;
+  int anchor_max_mismatches = -1;
+  int anchor_min_identity = 0;
   Args pe1, pe2, pe12, se;
   NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(Options, out_dir, temp_dir, out_prefix, presets, merge_index,
       merge_dedup, merge_sort_memory,
@@ -79,7 +87,8 @@ struct Options {
       auto_k, set_list_by_min_max_step, no_mercy, no_local, keep_tmp_files, kmin_1pass,
       debug_assembly, merge_pairs, verbose, hw_accel, k_list, reduction_k_list,
       flanking_k_list, legacy_k_list, reduction_k_list_set, flanking_k_list_set,
-      flanking_consensus_only, pe1, pe2, pe12, se)
+      flanking_consensus_only, flanking_end_anchors, reduction_end_anchors, anchor_graph_report,
+      anchor_graph_thread, anchor_max_mismatches, anchor_min_identity, pe1, pe2, pe12, se)
 };
 const char *help = R"(MEGAHIT native C++ workflow (no Python runtime required)
 Usage: megahit [options] {-1 mates1 -2 mates2 | --12 interleaved | -r reads}
@@ -97,14 +106,21 @@ Inputs (repeatable, comma-separated; FASTA/FASTQ, plain/gzip/bzip2):
 
 Assembly:
   --reduction-k-list LIST      [21,29,39,59]
+  --reduction-end-anchors      Opt into anchors in descending reduction [off by default]
   --flanking-k-list LIST       [21,31,41,61,81,101,141]
   --flanking-consensus-only    Flanking uses retained contigs + consensus, no read edges
+  --flanking-end-anchors       Opt into stitched ends [default: assemble full contigs]
+  --anchor-graph-report        Report exact paths in the cleaned SdBG without changing restoration
+  --anchor-graph-thread        Opt into threaded contigs for flanking restoration
+  --no-anchor-graph-thread     In anchor mode, restore from raw SdBG unitigs [default]
+  --anchor-max-mismatches N    Report short-seed matches; allow N substitutions in a full anchor (0-8)
+  --anchor-min-identity PCT    Enable gapped flanking alignment at this minimum identity (e.g. 30)
   --k-list LIST                Legacy shared list: reduction k<=60, flanking all
   --k-min N --k-max N --k-step N  Override k-list; odd k, even step <=28
   --min-count N                Minimum edge multiplicity [2]
-  --merge-index fm|hash        Exact contig-end overlap index [hash]
-  --merge-dedup bloom|sort     Merge candidate redundancy filter [sort]
-  --merge-sort-memory X       Sort record buffers in MiB [128]
+  --merge-index fm|hash       Accepted for legacy option compatibility
+  --merge-dedup bloom|sort    Accepted for legacy option compatibility
+  --merge-sort-memory X       Reduced-edge sort record buffers in MiB [128]
   --min-contig-len N           Final minimum contig length [200]
   --no-mercy --no-local --kmin-1pass --no-hw-accel
   --bubble-level N             Bubble cleaning intensity [2]
@@ -214,6 +230,21 @@ Options parse(int argc, char **argv) {
     else if (key == "--no-mercy") opt.no_mercy = true;
     else if (key == "--no-local") opt.no_local = true;
     else if (key == "--flanking-consensus-only") opt.flanking_consensus_only = true;
+    else if (key == "--flanking-end-anchors") opt.flanking_end_anchors = true;
+    else if (key == "--reduction-end-anchors") opt.reduction_end_anchors = true;
+    else if (key == "--anchor-graph-report") opt.anchor_graph_report = true;
+    else if (key == "--anchor-graph-thread") opt.anchor_graph_thread = true;
+    else if (key == "--no-anchor-graph-thread") opt.anchor_graph_thread = false;
+    else if (key == "--anchor-min-identity") {
+      opt.anchor_min_identity = integer(value());
+      if (opt.anchor_min_identity < 1 || opt.anchor_min_identity > 100)
+        throw Error("--anchor-min-identity must be a percentage between 1 and 100");
+    }
+    else if (key == "--anchor-max-mismatches") {
+      opt.anchor_max_mismatches = integer(value());
+      if (opt.anchor_max_mismatches < 0 || opt.anchor_max_mismatches > 8)
+        throw Error("--anchor-max-mismatches must be between 0 and 8");
+    }
     else if (key == "--kmin-1pass") opt.kmin_1pass = true;
     else if (key == "--no-hw-accel") opt.hw_accel = false;
     else if (key == "--keep-tmp-files") opt.keep_tmp_files = true;
@@ -260,13 +291,6 @@ class Driver {
   std::string read_count(int k) const { return reduction_path(k, "read_count"); }
   int initial_k() const {
     return opt.reduction_k_list.empty() ? opt.flanking_k_list.front() : opt.reduction_k_list.front();
-  }
-  std::string current_edges(int k) const {
-    for (const auto &type : {"merged_edges", "reduced_edges"}) {
-      auto prefix = reduction_path(k, type);
-      if (exists(prefix + ".edges.info")) return prefix;
-    }
-    return k == initial_k() ? graph(k) : read_count(k);
   }
   std::string lib() const { return opt.temp_dir + "/reads.lib"; }
   std::string ends(int k) const {
@@ -372,6 +396,10 @@ class Driver {
     };
     check_list(opt.reduction_k_list, "reduction-k-list", 28);
     check_list(opt.flanking_k_list, "flanking-k-list", 40);
+    if (opt.anchor_graph_report && !opt.flanking_end_anchors && !opt.reduction_end_anchors)
+      throw Error("--anchor-graph-report requires an end-anchor mode");
+    if (opt.anchor_min_identity && (!opt.flanking_end_anchors || opt.anchor_graph_thread || opt.anchor_max_mismatches >= 0))
+      throw Error("--anchor-min-identity requires raw --flanking-end-anchors without --anchor-max-mismatches");
     if (opt.min_count <= 0 || opt.min_contig_len < 0) throw Error("Invalid minimum count/contig length");
     if (opt.min_count == 1) { opt.no_mercy = true; opt.kmin_1pass = true; }
     if (opt.memory <= 0 || !std::isfinite(opt.memory)) throw Error("Memory must be positive");
@@ -614,12 +642,15 @@ class Driver {
            "Extract read-counted (k+1)-mers for k = " + number(k));
     });
   }
-  void graph_edges(int k, const std::string &input, const std::string &output, const std::string &name) {
+  void graph_edges(int k, const std::string &input, const std::string &output,
+                   const std::string &name, int from = 0) {
     checkpoint(name, {output + ".sdbg_info"}, [&]() {
-      Args args{"seq2sdbg"}; auto common = graph_options(k, output);
+      Args args{"seq2sdbg"}; auto common = graph_options(k, output, from);
       args.insert(args.end(), common.begin(), common.end());
       args.insert(args.end(), {"--input_prefix", input});
-      core(args, "Build graph for k = " + number(k) + " from " + input);
+      if (from) args.insert(args.end(), {"--contig", contig(from) + ".contigs.fa"});
+      core(args, "Build graph for k = " + number(k) + " from " + input +
+                     (from ? " and k = " + number(from) + " contigs" : ""));
     });
   }
   void clear_edges(const std::string &prefix) {
@@ -628,12 +659,10 @@ class Driver {
     for (const auto &name : entries(parent(prefix))) if (name.compare(0, start.size(), start) == 0)
       remove_file(parent(prefix) + "/" + name);
   }
-  std::string reduce(int from, int to) {
-    std::string input = from == initial_k() ? graph(from) : reduction_path(from, "merged_edges");
-    const bool merged_input = from != initial_k() && exists(input + ".edges.info");
-    if (!merged_input && from != initial_k()) input = read_count(from);
+  void reduce(int from, int to) {
+    std::string input = from == initial_k() ? graph(from) : read_count(from);
     std::string longer = read_count(to), output = reduction_path(from, "reduced_edges");
-    checkpoint("reduce-dedup-v3-k" + number(from) + "-k" + number(to), {output + ".edges.info"}, [&]() {
+    checkpoint("reduce-counted-v4-k" + number(from) + "-k" + number(to), {output + ".edges.info"}, [&]() {
       if (!exists(input + ".edges.info") || !exists(longer + ".edges.info")) throw Error("Missing reduction input edges");
       clear_edges(output);
       Args args{"prefixbf", "--mode", "reduce", "--short_prefix", input, "--long_prefix", longer,
@@ -641,52 +670,50 @@ class Driver {
             "--num_cpu_threads", number(opt.num_cpu_threads), "--human_readable", "0",
             "--reduce_dedup", "--sort_memory_mb", number(opt.merge_sort_memory),
             "--max_bloom_gb", "60", "--reserve_gb", "1", "--host_mem", number(host_mem)};
-      if (merged_input) args.insert(args.end(), {"--read_counted_shards", number(opt.num_cpu_threads)});
       core(args, "Reduce edges for k = " + number(from) + " using k = " + number(to), true);
     });
-    return output;
   }
-  void merge_edges(int from, int to) {
-    std::string prefix = contig(from), output = reduction_path(to, "merged_edges");
-    const bool terminal = to == opt.reduction_k_list.back();
-    const std::string stage = terminal ? "merge-terminal-multi2-v4-k" : "merge-deferred-multi2-v4-k";
-    checkpoint(stage + number(from) + "-k" + number(to), {output + ".edges.info"}, [&]() {
-      clear_edges(output);
-      Args args{"prefixbf", "--mode", "merge", "--long_prefix", read_count(to), "--output_prefix", output,
-            "--long_contig", prefix + ".contigs.fa",
-            "--short_k", number(from), "--long_k", number(to), "--num_cpu_threads",
-            number(opt.num_cpu_threads), "--human_readable", "0", "--merge_index", opt.merge_index,
-            "--merge_dedup", terminal ? opt.merge_dedup : "none", "--sort_memory_mb", number(opt.merge_sort_memory),
-            "--host_mem", number(host_mem), "--contig_edge_multiplicity", "2"};
-      core(args, "Merge k = " + number(from) + " assembly edges into k = " + number(to), true);
-    });
-  }
-  void assemble(int k, const std::string &input, int next = 0) {
+  void assemble(int k, const std::string &input, const std::string &anchor_output = "",
+                const std::string &anchor_source = "", size_t anchor_end_length = 0,
+                bool anchor_stitched_only = false) {
     int final_k = opt.flanking_k_list.back();
-    if (!flanking && !opt.reduction_k_list.empty()) final_k = std::max(final_k, opt.reduction_k_list.back());
-    Args outputs{contig(k) + ".contigs.fa", contig(k) + ".contigs.fa.info",
-                 contig(k) + ".bubble_seq.fa", contig(k) + ".bubble_seq.fa.info"};
-    std::string stage = next ? "assemble-long-only-v2-k" + number(k) + "-to-k" + number(next)
-                             : "assemble-k" + number(k);
-    checkpoint(stage, outputs, [&]() {
+    const bool in_final_phase = flanking || opt.reduction_k_list.empty();
+    const bool final_round = in_final_phase && k == final_k;
+    std::string prefix = anchor_output.empty() ? contig(k) : anchor_output;
+    Args outputs{prefix + ".contigs.fa", prefix + ".contigs.fa.info",
+                 prefix + ".bubble_seq.fa", prefix + ".bubble_seq.fa.info"};
+    const std::string graph_report = (opt.anchor_graph_report || opt.anchor_graph_thread) && !anchor_source.empty() ?
+        contig(k) + ".anchor-graph-paths.tsv" : "";
+    const std::string threaded = opt.anchor_graph_thread && !anchor_source.empty() ?
+        contig(k) + ".anchor-threaded.fa" : "";
+    if (!graph_report.empty()) outputs.push_back(graph_report);
+    if (!threaded.empty()) outputs.push_back(threaded);
+    const std::string stage = !anchor_output.empty() ? "assemble-anchor-unitigs-k" :
+                              in_final_phase ? "assemble-k" : "assemble-reverse-reduction-k";
+    checkpoint(stage + number(k), outputs, [&]() {
       mkdirs(contig_dir());
-      remove_file(contig(k) + ".addi.fa");
-      remove_file(contig(k) + ".addi.fa.info");
+      remove_file(prefix + ".addi.fa");
+      remove_file(prefix + ".addi.fa.info");
       int standalone = std::max(std::min(final_k * 3 - 1, int(opt.min_contig_len * 1.5)), opt.min_contig_len);
       if (opt.max_tip_len >= 0) standalone = std::max(opt.max_tip_len + final_k - 1, opt.min_contig_len);
       double tip = opt.max_tip_len;
       if (tip == -1 && k * 3 - 1 > opt.min_contig_len * 1.5) tip = std::max(1.0, opt.min_contig_len * 1.5 + 1 - k);
-      Args args{"assemble", "-s", input, "-o", contig(k), "-t", number(opt.num_cpu_threads),
-                "--min_standalone", number(next ? 0 : standalone), "--prune_level", number(next ? 0 : opt.prune_level),
-                "--merge_len", number(next ? 0 : opt.merge_len), "--merge_similar", number(opt.merge_similar),
-                "--cleaning_rounds", number(next ? 1 : opt.cleaning_rounds),
+      Args args{"assemble", "-s", input, "-o", prefix, "-t", number(opt.num_cpu_threads),
+                "--min_standalone", number(standalone), "--prune_level", number(opt.prune_level),
+                "--merge_len", number(opt.merge_len), "--merge_similar", number(opt.merge_similar),
+                "--cleaning_rounds", number(opt.cleaning_rounds),
                 "--disconnect_ratio", number(opt.disconnect_ratio), "--low_local_ratio", number(opt.low_local_ratio),
-                "--min_depth", number(next ? 0 : opt.prune_depth), "--bubble_level", number(next ? 0 : opt.bubble_level),
-                "--max_tip_len", number(next ? 0 : tip)};
-      if (next) args.insert(args.end(), {"--min_contig_len", number(next + 1)});
-      if (k < final_k && !next) args.push_back("--careful_bubble");
-      if (k == final_k) args.push_back("--is_final_round");
-      if (opt.no_local && (flanking || opt.reduction_k_list.empty())) args.push_back("--output_standalone");
+                "--min_depth", number(opt.prune_depth), "--bubble_level", number(opt.bubble_level),
+                "--max_tip_len", number(tip)};
+      args.push_back(final_round ? "--is_final_round" : "--careful_bubble");
+      if (opt.no_local && in_final_phase && !opt.flanking_end_anchors) args.push_back("--output_standalone");
+      if (!graph_report.empty()) {
+        args.insert(args.end(), {"--anchor_source", anchor_source,
+                                 "--anchor_end_length", number(anchor_end_length),
+                                 "--anchor_path_report", graph_report});
+      }
+      if (!threaded.empty()) args.insert(args.end(), {"--anchor_threaded_contigs", threaded});
+      if (anchor_stitched_only && !threaded.empty()) args.push_back("--anchor_stitched_only");
       core(args, "Assemble contigs from SdBG for k = " + number(k));
     });
   }
@@ -809,13 +836,86 @@ class Driver {
       core(args, "Seed flanking k = " + number(k) + " from k = " + number(source_k) + " contigs");
     });
   }
-  void iterate(int from, int to) {
+  void iterate(int from, int to, const std::string &anchors = "", const std::string &empty_bubbles = "") {
     std::string output = graph(to);
-    checkpoint("iterate-k" + number(from) + "-k" + number(to), {output + ".edges.info"}, [&]() {
-      core({"iterate", "-c", contig(from) + ".contigs.fa", "-b", contig(from) + ".bubble_seq.fa",
+    checkpoint((anchors.empty() ? "iterate-k" : "iterate-anchors-k") + number(from) + "-k" + number(to),
+               {output + ".edges.info"}, [&]() {
+      core({"iterate", "-c", anchors.empty() ? contig(from) + ".contigs.fa" : anchors,
+            "-b", anchors.empty() ? contig(from) + ".bubble_seq.fa" : empty_bubbles,
             "-t", number(opt.num_cpu_threads), "-k", number(from), "-s", number(to - from),
             "-o", output, "-r", lib() + ".bin"},
            "Extract iterative edges from k = " + number(from) + " to " + number(to));
+    });
+  }
+  enum class AnchorStage { Reduction, FlankingSeed, FlankingIteration };
+  void anchor_transition(int from, int to, const std::string &source, AnchorStage stage) {
+    const bool reducing = stage == AnchorStage::Reduction;
+    const size_t end_length = reducing ? std::max({100, opt.flanking_k_list.back(), opt.reduction_k_list.back()}) :
+        kFlankingAnchorEndLength;
+    const bool use_threaded = !reducing && opt.anchor_graph_thread;
+    const bool best_hit = !reducing && !use_threaded;
+    const std::string output = reducing ? reduction_path(to, "assembly_graph") : graph(to);
+    const std::string reduced_edges = reducing ? reduction_path(to, "reduced_edges") : "";
+    const std::string original = source + ".contigs.fa";
+    const std::string anchors = output + ".anchors.fa", no_bubbles = output + ".anchors.bubble.fa";
+    const std::string outward = output + ".outward.fa", raw = output + ".anchor-unitigs";
+    const bool with_consensus = !reducing && !opt.no_local;
+    const bool with_iterative_edges = stage == AnchorStage::FlankingIteration && !opt.flanking_consensus_only;
+    Args inputs{anchors, anchors + ".info"};
+    if (with_iterative_edges) inputs.push_back(no_bubbles);
+    if (with_consensus) inputs.insert(inputs.end(), {outward, outward + ".info"});
+    const std::string anchor_stage = reducing ? "end-anchors-k" : "end-anchors-290-k";
+    checkpoint(anchor_stage + number(from) + "-to-k" + number(to), inputs, [&]() {
+      write_end_anchors(original, anchors, end_length);
+      if (with_iterative_edges) atomic_text(no_bubbles, "");
+      if (with_consensus) write_outward_consensus(source + ".local.fa", outward, end_length);
+      log("Prepare " + number(end_length) + " bp end anchors for " +
+          (reducing ? "reduction" : "flanking") + " k = " + number(to));
+    });
+    if (with_iterative_edges) iterate(from, to, anchors, no_bubbles);
+    checkpoint("anchor-graph-k" + number(to), {output + ".sdbg_info"}, [&]() {
+      Args args{"seq2sdbg"}; auto common = graph_options(to, output, from);
+      args.insert(args.end(), common.begin(), common.end());
+      args.insert(args.end(), {"--contig", anchors});
+      if (reducing) args.insert(args.end(), {"--input_prefix", reduced_edges});
+      else if (with_iterative_edges) args.insert(args.end(), {"--input_prefix", output});
+      if (with_consensus) args.insert(args.end(), {"--local_contig", outward});
+      core(args, "Build end-anchor SdBG for k = " + number(to));
+    });
+    assemble(to, output, raw, original, end_length, use_threaded);
+    std::string target = contig(to);
+    const std::string raw_unitigs = raw + ".contigs.fa";
+    const std::string candidates = use_threaded ? target + ".anchor-threaded.fa" : raw_unitigs;
+    const int min_identity = best_hit ? opt.anchor_min_identity : 0;
+    const std::string report = min_identity ? target + ".anchor-alignments.tsv" :
+        opt.anchor_max_mismatches >= 0 ? target + ".anchor-matches.tsv" : "";
+    Args restored{target + ".contigs.fa", target + ".contigs.fa.info"};
+    if (!report.empty()) restored.push_back(report);
+    if (reducing) restored.insert(restored.end(), {target + ".bubble_seq.fa", target + ".bubble_seq.fa.info"});
+    const std::string restore_stage = (use_threaded ?
+        "restore-mixed-flanking-anchors-v2" : best_hit ? "restore-best-hit-flanking-anchors" :
+        opt.anchor_max_mismatches > 0 ? "restore-short-seed-anchors" : "restore-reduction-anchors-only") +
+        (min_identity ? "-identity-" + number(min_identity) :
+         opt.anchor_max_mismatches > 0 ? "-" + number(opt.anchor_max_mismatches) : "") + "-k";
+    checkpoint(restore_stage + number(to), restored, [&]() {
+      if (use_threaded) log("Match stitched anchors to threaded contigs and whole anchors to raw unitigs for k = " + number(to));
+      if (min_identity) log("Align anchors to raw SdBG unitigs at " + number(min_identity) + "% minimum identity for k = " + number(to));
+      else if (best_hit) log("Restore original contigs at best hits in raw SdBG unitigs for k = " + number(to));
+      auto stats = restore_end_anchors(original, candidates,
+                                       target + ".contigs.fa", end_length, to, opt.num_cpu_threads,
+                                       opt.anchor_max_mismatches, report,
+                                       use_threaded ? raw_unitigs : "", best_hit, min_identity);
+      if (reducing) {
+        // Ordinary flanking can use the restored contigs, but not synthetic graph alternatives.
+        atomic_text(target + ".bubble_seq.fa", "");
+        atomic_text(target + ".bubble_seq.fa.info", "0 0\n");
+        remove_file(target + ".addi.fa");
+        remove_file(target + ".addi.fa.info");
+      }
+      log("End-anchor restore at k = " + number(to) + ": " + number(stats.contigs) +
+          " source contigs, " + number(stats.contigs - stats.joined) + " output contigs, " +
+          number(stats.extended) + " with added sequence, " +
+          number(stats.bases_added) + " bases added");
     });
   }
   void merge_final(int k) {
@@ -896,18 +996,7 @@ class Driver {
       for (size_t i = 1; i < reduction.size(); ++i) {
         int from = reduction[i - 1], to = reduction[i];
         count(to, false);
-        // Resolve the input only when this stage runs: on resume a previously
-        // generated reduced prefix must not accidentally become its own input.
-        std::string reduced;
-        if (opt.continue_mode && completed.value("reduce-dedup-v3-k" + number(from) + "-k" + number(to), false)
-            && resume_valid && exists(reduction_path(from, "reduced_edges") + ".edges.info")) {
-          reduced = reduction_path(from, "reduced_edges");
-          visited["reduce-dedup-v3-k" + number(from) + "-k" + number(to)] = true;
-          log("Reuse reduction edges for k = " + number(from));
-        } else reduced = reduce(from, to);
-        std::string assembled = reduction_path(from, "assembly_graph");
-        graph_edges(from, reduced, assembled, "reduced-graph-k" + number(from));
-        assemble(from, assembled, to); merge_edges(from, to);
+        reduce(from, to);
       }
       int current;
       if (!reduction.empty()) {
@@ -915,14 +1004,28 @@ class Driver {
         if (reduction.size() == 1) { graph_sequences(current, 0); assemble(current, graph(current)); }
         else {
           std::string output = reduction_path(current, "assembly_graph");
-          graph_edges(current, current_edges(current), output, "handoff-graph-k" + number(current));
+          graph_edges(current, read_count(current), output, "reverse-reduction-start-graph-k" + number(current));
           assemble(current, output);
+          for (size_t i = reduction.size() - 1; i > 0; --i) {
+            int target = reduction[i - 1];
+            if (opt.reduction_end_anchors) {
+              anchor_transition(current, target, contig(current), AnchorStage::Reduction);
+            } else {
+              std::string target_graph = reduction_path(target, "assembly_graph");
+              graph_edges(target, reduction_path(target, "reduced_edges"), target_graph,
+                          "reverse-reduction-graph-k" + number(current) + "-to-k" + number(target), current);
+              assemble(target, target_graph);
+            }
+            current = target;
+          }
         }
         if (!opt.no_local) local(current, opt.flanking_k_list.front());
         std::string source = contig(current); int source_k = current;
         flanking = true; mkdirs(contig_dir());
         log("Restarting consensus flanking assembly at k = " + number(opt.flanking_k_list.front()) + " from k = " + number(source_k));
-        seed(source_k, source); current = opt.flanking_k_list.front(); assemble(current, graph(current));
+        current = opt.flanking_k_list.front();
+        if (opt.flanking_end_anchors) anchor_transition(source_k, current, source, AnchorStage::FlankingSeed);
+        else { seed(source_k, source); assemble(current, graph(current)); }
       } else {
         current = first;
         if (!first_built) graph_sequences(current, 0);
@@ -930,8 +1033,12 @@ class Driver {
       }
       for (int next : opt.flanking_k_list) if (next > current) {
         if (!opt.no_local) local(current, next);
-        if (!opt.flanking_consensus_only) iterate(current, next);
-        graph_sequences(next, current); assemble(next, graph(next)); current = next;
+        if (opt.flanking_end_anchors) anchor_transition(current, next, contig(current), AnchorStage::FlankingIteration);
+        else {
+          if (!opt.flanking_consensus_only) iterate(current, next);
+          graph_sequences(next, current); assemble(next, graph(next));
+        }
+        current = next;
       }
       merge_final(current);
     } catch (const EarlyTerminate &early) { merge_final(early.k); }

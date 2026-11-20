@@ -61,6 +61,9 @@ set_source_files_properties(src/flash/flash.c PROPERTIES
 target_link_libraries(flash PUBLIC ${ZLIB_LIBRARIES} Threads::Threads)
 add_subdirectory(src/minimap2)
 
+add_library(edlib STATIC src/vendor/edlib/edlib.cpp)
+target_include_directories(edlib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/edlib)
+
 add_library(libsais STATIC src/vendor/libsais/src/libsais.c src/vendor/libsais/src/libsais64.c)
 set_target_properties(libsais PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
 target_compile_definitions(libsais PUBLIC LIBSAIS_OPENMP)
@@ -138,10 +141,11 @@ add_custom_command(
         VERBATIM)
 
 add_executable(megahit src/native/entry.cpp src/native/platform.cpp src/native/workflow.cpp
+        src/native/end_anchors.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/native_pigz.cpp $<TARGET_OBJECTS:megahit_objects>)
 target_include_directories(megahit PRIVATE ${ZLIB_INCLUDE_DIRS} ${BZIP2_INCLUDE_DIR})
 target_compile_definitions(megahit PRIVATE MEGAHIT_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/test_data")
-target_link_libraries(megahit ${ZLIB_LIBRARIES} ${BZIP2_LIBRARIES} flash minimap2 libsais)
+target_link_libraries(megahit ${ZLIB_LIBRARIES} ${BZIP2_LIBRARIES} flash minimap2 libsais edlib)
 if(STATIC_BUILD)
     set_target_properties(megahit PROPERTIES LINK_SEARCH_START_STATIC ON LINK_SEARCH_END_STATIC ON)
 endif()
